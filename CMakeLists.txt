@@ -44,32 +44,32 @@ option(NINFER_BUILD_APPS "Build the NInfer CLI and server" ON)
 add_compile_definitions($<$<COMPILE_LANGUAGE:CXX>:NINFER_GFX906=1>)
 
 add_library(ninfer_core STATIC
-  common/log.cpp
-  common/util.cpp
-  common/json.cpp
-  core/device.hip
-  core/safetensors.cpp
-  frontend/unicode.cpp
-  frontend/tokenizer.cpp
-  frontend/chat.cpp
-  ops/linear.hip
-  ops/kernels.hip
-  ops/attention.hip
-  ops/moe.hip
-  models/config.cpp
-  models/model.hip
-  runtime/kv_cache.cpp
-  runtime/engine.cpp
+  src/common/log.cpp
+  src/common/util.cpp
+  src/common/json.cpp
+  src/core/device.hip
+  src/core/safetensors.cpp
+  src/frontend/unicode.cpp
+  src/frontend/tokenizer.cpp
+  src/frontend/chat.cpp
+  src/ops/linear.hip
+  src/ops/kernels.hip
+  src/ops/attention.hip
+  src/ops/moe.hip
+  src/models/config.cpp
+  src/models/model.hip
+  src/runtime/kv_cache.cpp
+  src/runtime/engine.cpp
 )
-target_include_directories(ninfer_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_include_directories(ninfer_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(ninfer_core PUBLIC hip::host roc::rocblas)
 target_compile_options(ninfer_core PRIVATE
   $<$<COMPILE_LANGUAGE:HIP>:-O3 -w>)
 
 if(NINFER_BUILD_APPS)
-  add_executable(ninfer apps/ninfer.cpp)
+  add_executable(ninfer src/apps/ninfer.cpp)
   target_link_libraries(ninfer PRIVATE ninfer_core)
 
-  add_executable(ninfer-serve apps/ninfer_serve.cpp apps/http_server.cpp)
+  add_executable(ninfer-serve src/apps/ninfer_serve.cpp src/apps/http_server.cpp)
   target_link_libraries(ninfer-serve PRIVATE ninfer_core)
 endif()
