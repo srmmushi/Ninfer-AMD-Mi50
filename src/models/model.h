@@ -3,9 +3,12 @@
 // buffers and the prefill/decode forward pass. Mirrors ninfer's
 // models/qwen3_5 Model + execution layer for the supported subset.
 
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <vector>
+
+#include <hip/hip_runtime.h>
 
 #include "models/config.h"
 
@@ -27,7 +30,7 @@ class Model {
   Model(const Model&) = delete;
   Model& operator=(const Model&) = delete;
 
-  const ModelConfig& config() const { return config_; }
+  const ModelConfig& config() const;
   int prefill_chunk() const { return prefill_chunk_; }
   int max_context() const { return max_context_; }
 
@@ -37,16 +40,13 @@ class Model {
   const float* forward(const std::vector<int64_t>& tokens, int pos0,
                        KVCache& kv, hipStream_t stream);
 
-  size_t weight_bytes() const { return weight_bytes_; }
+  size_t weight_bytes() const;
 
  private:
   struct Impl;
   std::unique_ptr<Impl> impl_;
-
-  ModelConfig config_;
   int prefill_chunk_;
   int max_context_;
-  size_t weight_bytes_ = 0;
 };
 
 }  // namespace ninfer

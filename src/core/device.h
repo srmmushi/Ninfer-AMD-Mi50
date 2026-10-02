@@ -7,6 +7,7 @@
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
@@ -71,7 +72,7 @@ class DeviceBuffer {
 
   void reset() {
     if (ptr_) {
-      hipFree(ptr_);
+      (void)hipFree(ptr_);
       ptr_ = nullptr;
     }
     size_ = 0;

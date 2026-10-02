@@ -3,6 +3,7 @@
 // HuggingFace `tokenizer.json` (replaces ninfer's jinja-driven frontend
 // resources with a direct HF-compatible path).
 
+#include <cstdint>
 #include <map>
 #include <string>
 #include <unordered_map>
@@ -28,7 +29,9 @@ class Tokenizer {
   std::string decode(const std::vector<int64_t>& ids) const;
   std::string decode_one(int64_t id) const;
   std::string token_text(int64_t id) const;
-  bool is_special(int64_t id) const { return special_ids_.count(id) != 0; }
+  bool is_special(int64_t id) const {
+    return special_id_to_text_.count(id) != 0;
+  }
 
  private:
   std::vector<std::string> id_to_token_;

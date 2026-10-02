@@ -21,8 +21,8 @@ KVCache::KVCache(int layers, int max_context, int kv_heads, int head_dim)
 }
 
 KVCache::~KVCache() {
-  for (void* p : k_) hipFree(p);
-  for (void* p : v_) hipFree(p);
+  for (void* p : k_) (void)hipFree(p);
+  for (void* p : v_) (void)hipFree(p);
 }
 
 void KVCache::append(int layer, int pos, const void* src_k, const void* src_v,

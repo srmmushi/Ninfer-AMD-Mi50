@@ -58,22 +58,4 @@ void Blas::gemm_view(const void* a, int lda, bool trans_a, const void* b,
            c_fp32 ? rocblas_datatype_f32_r : rocblas_datatype_f16_r, stream);
 }
 
-void Blas::gemm_batched_fp16(const void* a, const void* b, void* out, int M,
-                             int N, int K, int64_t stride_a, int64_t stride_b,
-                             int64_t stride_c, int batch, hipStream_t stream) {
-  float alpha = 1.0f, beta = 0.0f;
-  rocblas_set_stream(handle_, stream);
-  auto st = rocblas_gemm_strided_batched_ex(
-      handle_, rocblas_operation_transpose, rocblas_operation_none, N, M, K,
-      &alpha, a, rocblas_datatype_f16_r, K, stride_a, b,
-      rocblas_datatype_f16_r, K, stride_b, &beta, out, rocblas_datatype_f16_r,
-      N, stride_c, out, rocblas_datatype_f16_r, N, stride_c,
-      rocblas_datatype_f32_r, rocblas_gemm_algo_standard, 0, 0, batch);
-  if (st != rocblas_status_success) {
-    throw std::runtime_error(std::string("rocblas_gemm_strided_batched_ex "
-                                         "failed: ") +
-                             rocblas_status_to_string(st));
-  }
-}
-
 }  // namespace ninfer

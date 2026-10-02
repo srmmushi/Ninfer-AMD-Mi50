@@ -7,6 +7,7 @@
 #include <stdexcept>
 
 #include "common/log.h"
+#include "common/util.h"
 #include "core/device.h"
 
 namespace ninfer {

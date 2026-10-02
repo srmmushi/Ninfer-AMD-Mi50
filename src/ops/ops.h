@@ -29,10 +29,6 @@ class Blas {
   // logits-style: out fp32, inputs fp16.
   void gemm_fp32out(const void* x, const void* w, void* out, int M, int N, int K,
                     hipStream_t stream = 0);
-  // strided-batched fp16 out.
-  void gemm_batched_fp16(const void* a, const void* b, void* out, int M, int N,
-                         int K, int64_t stride_a, int64_t stride_b,
-                         int64_t stride_c, int batch, hipStream_t stream = 0);
 
   // Generic column-major entry (used by attention views with arbitrary
   // strides): C[M,N] = op(A)[M,K] * op(B)[K,N]; C is fp16 or fp32.

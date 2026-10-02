@@ -86,7 +86,7 @@ struct Model::Impl {
   }
 
   DeviceBuffer load_fp16(const WeightSource& ws, const std::string& name,
-                         bool required = true) const {
+                         bool required = true) {
     DeviceBuffer buf;
     auto it = ws.by_name.find(name);
     if (it == ws.by_name.end()) {

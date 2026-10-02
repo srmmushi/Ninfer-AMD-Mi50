@@ -50,6 +50,8 @@ class Json {
   std::vector<Json>& items() { return arr_; }
   void push_back(Json v) { arr_.push_back(std::move(v)); }
   const Json& at(size_t i) const { return arr_.at(i); }
+  // Object access by key (mirrors the array overload).
+  const Json& at(const std::string& key) const { return obj_.at(key); }
 
   // Object access.
   const std::map<std::string, Json>& members() const { return obj_; }

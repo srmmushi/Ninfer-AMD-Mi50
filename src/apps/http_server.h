@@ -2,6 +2,7 @@
 // Minimal threaded HTTP/1.1 server (POSIX sockets) — replaces the vendored
 // cpp-httplib of the original ninfer for the serving endpoint surface.
 
+#include <cstdint>
 #include <functional>
 #include <map>
 #include <string>
