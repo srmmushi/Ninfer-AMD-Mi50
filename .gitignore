@@ -1,0 +1,15 @@
+# 参考项目（上游原版 ninfer，不随本仓库分发）
+ninfer/
+
+# 构建产物
+build/
+build-*/
+*.o
+*.obj
+
+# IDE / 系统文件
+.codebuddy/
+.vs/
+.vscode/
+.idea/
+Thumbs.db
