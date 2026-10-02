@@ -125,39 +125,149 @@ void attention_decode_fp16(void* out, const void* q, const void* k_cache,
   }
 }
 
-void attention_prefill_head_fp16(void* out_head, const void* q_head,
-                                 const void* k_head, const void* v_head,
-                                 float* scores_scratch, int tq, int tk,
-                                 int q_offset, int head_dim, int q_row_stride,
-                                 int out_row_stride, float scale,
-                                 int kv_stride_token, Blas& blas,
-                                 hipStream_t stream) {
-  // Layout (row-major):
-  //   q_head: [tq, D] with row stride q_row_stride
-  //   k_head / v_head: rows of a [kv_len, kv_heads, D] cache, token stride
-  //                    kv_stride_token
-  //   out_head: [tq, D] with row stride out_row_stride
-  //   scores_scratch: fp32 [tq, tk], followed by an fp16 [tq, tk] region.
+// ---------------------------------------------------------------------------
+// Fused GQA prefill, ALL heads in one launch, flash-style online softmax.
+// Grid: (heads, ceil(q_len / BQ)); each block owns a 16-query tile of one
+// head and streams K/V tiles of 32 keys through LDS (gfx906 has no TMA or
+// cp.async — the LDS staging here is the latency-hiding equivalent).
+// ---------------------------------------------------------------------------
+template <int D>
+__global__ void prefill_attention_kernel(__half* out, const __half* q,
+                                         const __half* kc, const __half* vc,
+                                         int q_len, int kv_len, int pos0,
+                                         int heads, int kv_heads, float scale,
+                                         int q_row_stride, int out_row_stride) {
+  constexpr int BQ = 16;
+  constexpr int BK = 32;
+  __shared__ float q_s[BQ][D];
+  __shared__ float acc[BQ][D];
+  __shared__ __half k_s[BK][D];
+  __shared__ __half v_s[BK][D];
+  __shared__ float s_s[BQ][BK];
+  __shared__ float m_s[BQ], l_s[BQ], factor_s[BQ];
 
-  // S_cm [tk, tq] = K_cm^T [tk, D] * Q_cm [D, tq]
-  blas.gemm_view(k_head, kv_stride_token, /*trans_a=*/true, q_head,
-                 q_row_stride, /*trans_b=*/false, scores_scratch, /*ldc=*/tk,
-                 tk, tq, head_dim, /*c_fp32=*/true, stream);
+  int h = blockIdx.x;
+  int t0 = blockIdx.y * BQ;
+  int group = heads / kv_heads;
+  int kvh = h / group;
+  int kv_stride = kv_heads * D;
+  const __half* kbase = kc + static_cast<int64_t>(kvh) * D;
+  const __half* vbase = vc + static_cast<int64_t>(kvh) * D;
 
-  softmax_causal_rows_fp32(scores_scratch, tq, tk, q_offset, scale, stream);
+  for (int e = threadIdx.x; e < BQ * D; e += blockDim.x) {
+    int qi = e / D, d = e % D;
+    int t = t0 + qi;
+    q_s[qi][d] = (t < q_len)
+                     ? __half2float(q[static_cast<int64_t>(t) * q_row_stride +
+                                      h * D + d])
+                     : 0.0f;
+    acc[qi][d] = 0.0f;
+  }
+  if (threadIdx.x < BQ) {
+    m_s[threadIdx.x] = -INFINITY;
+    l_s[threadIdx.x] = 0.0f;
+  }
+  __syncthreads();
 
-  // fp16 copy of S placed after the fp32 region (scratch holds 6 bytes/elt).
-  __half* s16 =
-      reinterpret_cast<__half*>(scores_scratch) + 2 * static_cast<int64_t>(tq) * tk;
-  int64_t count = static_cast<int64_t>(tq) * tk;
-  int blocks = static_cast<int>((count + 255) / 256);
-  hipLaunchKernelGGL(cast_fp32_fp16_kernel, dim3(blocks), dim3(256), 0, stream,
-                     s16, scores_scratch, count);
+  for (int k0 = 0; k0 < kv_len; k0 += BK) {
+    int kn = BK < (kv_len - k0) ? BK : (kv_len - k0);
+    // Stage the K/V tile into LDS (cooperative load).
+    for (int e = threadIdx.x; e < BK * D; e += blockDim.x) {
+      int ki = e / D, d = e % D;
+      int t = k0 + ki;
+      k_s[ki][d] =
+          (t < kv_len) ? kbase[static_cast<int64_t>(t) * kv_stride + d]
+                       : __float2half(0.0f);
+      v_s[ki][d] =
+          (t < kv_len) ? vbase[static_cast<int64_t>(t) * kv_stride + d]
+                       : __float2half(0.0f);
+    }
+    __syncthreads();
 
-  // O_cm [D, tq] = V_cm [D, tk] * S_cm [tk, tq]  (s16 is S_cm in memory)
-  blas.gemm_view(v_head, kv_stride_token, /*trans_a=*/false, s16, /*ldb=*/tk,
-                 /*trans_b=*/false, out_head, out_row_stride, head_dim, tq, tk,
-                 /*c_fp32=*/false, stream);
+    // Scores for the BQ x BK sub-block; causal mask on absolute positions.
+    for (int p = threadIdx.x; p < BQ * BK; p += blockDim.x) {
+      int qi = p / BK, ki = p % BK;
+      int t = t0 + qi;
+      int k_abs = k0 + ki;
+      bool valid = (t < q_len) && (ki < kn) && (k_abs <= pos0 + t);
+      float dot = 0.0f;
+      if (valid) {
+        for (int d = 0; d < D; ++d) {
+          dot += q_s[qi][d] * __half2float(k_s[ki][d]);
+        }
+      }
+      s_s[qi][ki] = valid ? dot * scale : -INFINITY;
+    }
+    __syncthreads();
+
+    // Per-row online softmax update (serial tail over BQ threads).
+    if (threadIdx.x < BQ) {
+      int qi = threadIdx.x;
+      float m_tile = -INFINITY;
+      for (int ki = 0; ki < BK; ++ki) m_tile = fmaxf(m_tile, s_s[qi][ki]);
+      float m_new = fmaxf(m_s[qi], m_tile);
+      float l_add = 0.0f;
+      for (int ki = 0; ki < BK; ++ki) {
+        s_s[qi][ki] = expf(s_s[qi][ki] - m_new);
+        l_add += s_s[qi][ki];
+      }
+      factor_s[qi] = expf(m_s[qi] - m_new);
+      l_s[qi] = l_s[qi] * factor_s[qi] + l_add;
+      m_s[qi] = m_new;
+    }
+    __syncthreads();
+
+    // Rescale the running output and accumulate the weighted V tile (LDS:
+    // each v element is reused across all BQ query rows without DRAM refetch).
+    for (int e = threadIdx.x; e < BQ * D; e += blockDim.x) {
+      int qi = e / D, d = e % D;
+      float a = acc[qi][d] * factor_s[qi];
+      for (int ki = 0; ki < kn; ++ki) {
+        a += s_s[qi][ki] * __half2float(v_s[ki][d]);
+      }
+      acc[qi][d] = a;
+    }
+    __syncthreads();
+  }
+
+  for (int e = threadIdx.x; e < BQ * D; e += blockDim.x) {
+    int qi = e / D, d = e % D;
+    int t = t0 + qi;
+    if (t < q_len) {
+      out[static_cast<int64_t>(t) * out_row_stride + h * D + d] =
+          __float2half(acc[qi][d] / l_s[qi]);
+    }
+  }
+}
+
+void attention_prefill_fused_fp16(void* out, const void* q, const void* k_cache,
+                                  const void* v_cache, int q_len, int kv_len,
+                                  int pos0, int heads, int kv_heads,
+                                  int head_dim, int q_row_stride,
+                                  int out_row_stride, float scale,
+                                  hipStream_t stream) {
+  dim3 grid(heads, (q_len + 15) / 16);
+  if (head_dim == 128) {
+    hipLaunchKernelGGL((prefill_attention_kernel<128>), grid, dim3(256), 0,
+                       stream, static_cast<__half*>(out),
+                       static_cast<const __half*>(q),
+                       static_cast<const __half*>(k_cache),
+                       static_cast<const __half*>(v_cache), q_len, kv_len,
+                       pos0, heads, kv_heads, scale, q_row_stride,
+                       out_row_stride);
+  } else if (head_dim == 64) {
+    hipLaunchKernelGGL((prefill_attention_kernel<64>), grid, dim3(256), 0,
+                       stream, static_cast<__half*>(out),
+                       static_cast<const __half*>(q),
+                       static_cast<const __half*>(k_cache),
+                       static_cast<const __half*>(v_cache), q_len, kv_len,
+                       pos0, heads, kv_heads, scale, q_row_stride,
+                       out_row_stride);
+  } else {
+    throw std::runtime_error(
+        "unsupported head_dim for gfx906 prefill attention: " +
+        std::to_string(head_dim));
+  }
 }
 
 }  // namespace ninfer

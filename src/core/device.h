@@ -29,6 +29,22 @@ namespace ninfer {
 // Selects and pins device 0 at process startup (one GPU, one resident model).
 void init_device();
 
+// RAII device switch: all hipMalloc / kernel launches happen on the current
+// device, so every cross-device code path must hold a DeviceGuard.
+class DeviceGuard {
+ public:
+  explicit DeviceGuard(int device) {
+    hipGetDevice(&prev_);
+    hipSetDevice(device);
+  }
+  ~DeviceGuard() { hipSetDevice(prev_); }
+  DeviceGuard(const DeviceGuard&) = delete;
+  DeviceGuard& operator=(const DeviceGuard&) = delete;
+
+ private:
+  int prev_ = 0;
+};
+
 struct DeviceInfo {
   std::string name;
   int cu_count = 0;

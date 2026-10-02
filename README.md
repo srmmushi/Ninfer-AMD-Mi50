@@ -83,7 +83,24 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 Key options (both binaries): `--max-context` (KV capacity in tokens,
 startup-fixed), `--prefill-chunk` (chunked prefill size), `--max-new`,
 `--temperature`, `--top-k`, `--top-p`, `--repeat-penalty`, `--seed`,
-`--log-level debug|info|warn|error`.
+`--gpus 0,1` (dual-GPU layer-split pipeline), `--verify` (dual vs. single-GPU
+golden comparison), `--log-level debug|info|warn|error`.
+
+### Dual-GPU (layer-split pipeline)
+
+With `--gpus 0,1` the transformer layers are split into two contiguous shards
+(one per MI50): shard 0 holds the embedding and the first half of the layers,
+shard 1 holds the second half plus the final norm and LM head. Activations
+cross the shard boundary once per forward through `hipMemcpyPeerAsync`
+(PCIe P2P when the platform enables it, host-staged otherwise); each shard
+keeps its own KV cache, so per-device VRAM is roughly halved — a 14B model
+fits comfortably across 2×32 GiB. Correctness can be checked against a
+single-GPU golden run:
+
+```bash
+./build/ninfer /path/to/Qwen3-14B --gpus 0,1 --verify \
+  --prompt "..." --max-new 256
+```
 
 ## Architecture
 

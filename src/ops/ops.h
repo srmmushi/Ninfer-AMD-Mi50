@@ -55,9 +55,17 @@ void rmsnorm_heads_fp16(void* out, const void* x, const void* weight, int rows,
                         hipStream_t stream = 0);
 
 // RoPE (half-split rotate_half style) on [T, H, D] with explicit token
-// stride; positions start at `pos_offset` (chunked prefill aware).
+// stride; positions start at `pos_offset`. `inv_freq` is a device table of
+// head_dim/2 FP32 frequencies (precomputed once — avoids per-element powf).
 void rope_fp16(void* x, int tokens, int heads, int head_dim, int row_stride,
-               int pos_offset, float theta, hipStream_t stream = 0);
+               int pos_offset, const void* inv_freq, hipStream_t stream = 0);
+
+// Fused residual add + RMSNorm (one pass over the activation instead of two):
+//   hidden = hidden + residual        (written back, keeps the residual chain)
+//   normed = rmsnorm(hidden) * weight
+void fused_residual_rmsnorm_fp16(void* hidden_io, const void* residual,
+                                 void* normed, const void* weight, int rows,
+                                 int size, float eps, hipStream_t stream = 0);
 
 // SwiGLU: x [T, 2*I] -> out [T, I]; out = silu(x[:, :I]) * x[:, I:].
 void silu_and_mul_fp16(void* out, const void* x, int rows, int inner,
@@ -69,8 +77,8 @@ void residual_add_fp16(void* x_and_out, const void* residual, int rows, int size
 void embed_gather_fp16(void* out, const void* table, const int64_t* ids,
                        int tokens, int dim, hipStream_t stream = 0);
 
-// Causal softmax over the prefill score scratch of one head:
-//   s[i, j] for q row i (absolute pos = q_offset + i), k col j; masked j > q_abs.
+// Causal softmax over the prefill score scratch of one head (legacy path,
+// retained for reference; the fused kernel below supersedes it).
 void softmax_causal_rows_fp32(float* s, int tq, int tk_total, int q_offset,
                               float scale, hipStream_t stream = 0);
 
@@ -115,15 +123,17 @@ void attention_decode_fp16(void* out, const void* q, const void* k_cache,
                            int kv_heads, int head_dim, float scale,
                            hipStream_t stream = 0);
 
-// Prefill for one head via score scratch (row-major [tq, tk], 6 bytes/elt):
-//   fp32 [tq, tk] scores followed by an fp16 [tq, tk] region.
-//   out/q are per-head views with explicit row strides.
-void attention_prefill_head_fp16(void* out_head, const void* q_head,
-                                 const void* k_head, const void* v_head,
-                                 float* scores_scratch, int tq, int tk,
-                                 int q_offset, int head_dim, int q_row_stride,
-                                 int out_row_stride, float scale,
-                                 int kv_stride_token, Blas& blas,
-                                 hipStream_t stream = 0);
+// Fused GQA prefill for ALL heads in a single kernel (flash-style online
+// softmax, K/V tiles staged through LDS): removes the per-head GEMM/softmax
+// launch storm and the score scratch entirely.
+//   out: [q_len, heads, D]; q: [q_len, heads, D] view with row stride
+//   q_row_stride; caches: [kv_len, kv_heads, D]; causal mask on absolute
+//   positions pos0..pos0+q_len-1.
+void attention_prefill_fused_fp16(void* out, const void* q, const void* k_cache,
+                                  const void* v_cache, int q_len, int kv_len,
+                                  int pos0, int heads, int kv_heads,
+                                  int head_dim, int q_row_stride,
+                                  int out_row_stride, float scale,
+                                  hipStream_t stream = 0);
 
 }  // namespace ninfer

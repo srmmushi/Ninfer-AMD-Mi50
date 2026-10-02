@@ -9,7 +9,6 @@
 #include "frontend/chat.h"
 #include "frontend/tokenizer.h"
 #include "models/model.h"
-#include "runtime/kv_cache.h"
 
 namespace ninfer {
 
@@ -53,7 +52,6 @@ class Engine {
 
   std::unique_ptr<Model> model_;
   std::unique_ptr<Tokenizer> tokenizer_;
-  std::unique_ptr<KVCache> kv_;
   ChatRenderer renderer_;
 };
 

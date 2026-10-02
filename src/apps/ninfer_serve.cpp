@@ -28,6 +28,7 @@ struct ServeOptions {
   int top_k = 50;
   float top_p = 0.95f;
   float repeat_penalty = 1.05f;
+  std::vector<int> gpu_ids = {0};
 };
 
 ServeOptions parse(int argc, char** argv) {
@@ -35,8 +36,8 @@ ServeOptions parse(int argc, char** argv) {
   if (argc < 2) {
     throw std::runtime_error(
         "usage: ninfer-serve <model_dir> [--port N] [--max-context N] "
-        "[--prefill-chunk N] [--no-thinking] [--temperature F] [--top-k N] "
-        "[--top-p F] [--repeat-penalty F] [--log-level LEVEL]");
+        "[--prefill-chunk N] [--gpus 0,1] [--no-thinking] [--temperature F] "
+        "[--top-k N] [--top-p F] [--repeat-penalty F] [--log-level LEVEL]");
   }
   o.model_dir = argv[1];
   for (int i = 2; i < argc; ++i) {
@@ -53,6 +54,20 @@ ServeOptions parse(int argc, char** argv) {
     else if (a == "--top-k") o.top_k = std::stoi(next());
     else if (a == "--top-p") o.top_p = std::stof(next());
     else if (a == "--repeat-penalty") o.repeat_penalty = std::stof(next());
+    else if (a == "--gpus") {
+      std::string csv = next();
+      std::string item;
+      for (char c : csv) {
+        if (c == ',' || c == ' ') {
+          if (!item.empty()) o.gpu_ids.push_back(std::stoi(item));
+          item.clear();
+        } else {
+          item.push_back(c);
+        }
+      }
+      if (!item.empty()) o.gpu_ids.push_back(std::stoi(item));
+      if (o.gpu_ids.empty()) throw std::runtime_error("empty --gpus list");
+    }
     else if (a == "--log-level") {
       std::string lv = next();
       if (lv == "debug") global_log_level() = LogLevel::Debug;
@@ -196,6 +211,7 @@ int main(int argc, char** argv) {
     ModelOptions mo;
     mo.max_context = o.max_context;
     mo.prefill_chunk = o.prefill_chunk;
+    mo.gpu_ids = o.gpu_ids;
     Engine engine(o.model_dir, mo, !o.no_thinking);
     std::mutex gen_mutex;
 

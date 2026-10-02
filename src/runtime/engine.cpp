@@ -89,11 +89,9 @@ Engine::Engine(const std::string& model_dir, const ModelOptions& options,
   tokenizer_ = std::make_unique<Tokenizer>(path_join(model_dir, "tokenizer.json"));
   model_ = std::make_unique<Model>(model_dir, options);
   const ModelConfig& c = model_->config();
-  kv_ = std::make_unique<KVCache>(c.num_hidden_layers, options.max_context,
-                                  c.num_key_value_heads, c.head_dim);
-  LOG_INFO("engine ready: vocab=%d layers=%d ctx=%d chunk=%d",
+  LOG_INFO("engine ready: vocab=%d layers=%d ctx=%d chunk=%d gpus=%d",
            c.vocab_size, c.num_hidden_layers, options.max_context,
-           options.prefill_chunk);
+           options.prefill_chunk, model_->device_count());
 }
 
 Engine::~Engine() = default;
@@ -118,7 +116,7 @@ std::string Engine::generate_chat(const std::vector<ChatMessage>& messages,
 std::string Engine::run(std::vector<int64_t> ids, const SamplingParams& sp,
                         const TokenCallback& on_token) {
   if (ids.empty()) throw std::runtime_error("empty prompt");
-  if (static_cast<int>(ids.size()) > kv_->max_context() - sp.max_new_tokens) {
+  if (static_cast<int>(ids.size()) > model_->max_context() - sp.max_new_tokens) {
     throw std::runtime_error("prompt + max_new_tokens exceeds --max-context");
   }
 
@@ -132,19 +130,23 @@ std::string Engine::run(std::vector<int64_t> ids, const SamplingParams& sp,
   const float* logits_dev = nullptr;
   const int chunk = model_->prefill_chunk();
   int pos = 0;
+  model_->reset_cache();
   while (pos < static_cast<int>(ids.size())) {
     int end = std::min(pos + chunk, static_cast<int>(ids.size()));
     std::vector<int64_t> part(ids.begin() + pos, ids.begin() + end);
-    logits_dev = model_->forward(part, pos, *kv_, stream);
+    logits_dev = model_->forward(part, pos, stream);
     pos = end;
   }
 
-  // ---- Decode loop.
+  // ---- Decode loop. Logits live on the last shard's device.
   for (int step = 0; step < sp.max_new_tokens; ++step) {
     std::vector<float> logits(V);
-    HIP_CHECK(hipStreamSynchronize(stream));
-    HIP_CHECK(hipMemcpy(logits.data(), logits_dev, V * sizeof(float),
-                        hipMemcpyDeviceToHost));
+    {
+      DeviceGuard guard(model_->output_device());
+      HIP_CHECK(hipStreamSynchronize(stream));
+      HIP_CHECK(hipMemcpy(logits.data(), logits_dev, V * sizeof(float),
+                          hipMemcpyDeviceToHost));
+    }
     int64_t next = sample_token(logits.data(), V, sp, ids, rng);
 
     if (tokenizer_->is_special(next)) break;  // <|im_end|> etc.
@@ -160,7 +162,7 @@ std::string Engine::run(std::vector<int64_t> ids, const SamplingParams& sp,
     }
 
     if (step + 1 < sp.max_new_tokens) {
-      logits_dev = model_->forward({next}, pos, *kv_, stream);
+      logits_dev = model_->forward({next}, pos, stream);
       pos += 1;
     }
   }

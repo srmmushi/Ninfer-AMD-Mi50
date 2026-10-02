@@ -71,23 +71,60 @@ __global__ void rmsnorm_heads_kernel(__half* out, const __half* x,
 }
 
 __global__ void rope_kernel(__half* x, int tokens, int head_dim, int heads,
-                            int row_stride, int pos_offset, float theta) {
+                            int row_stride, int pos_offset,
+                            const float* inv_freq) {
   // x: rows of [heads, head_dim] with `row_stride` elements between tokens;
-  // one block per token.
+  // one block per token. Frequencies come from a precomputed device table,
+  // removing the per-element powf() of the naive version.
   int t = blockIdx.x;
   int half = head_dim / 2;
   int64_t base = static_cast<int64_t>(t) * row_stride;
+  float pos = static_cast<float>(pos_offset + t);
   for (int h = 0; h < heads; ++h) {
     __half* xr = x + base + static_cast<int64_t>(h) * head_dim;
     for (int i = threadIdx.x; i < half; i += blockDim.x) {
-      float freq = powf(theta, -2.0f * i / head_dim);
-      float angle = static_cast<float>(pos_offset + t) * freq;
+      float angle = pos * inv_freq[i];
       float c = cosf(angle), s = sinf(angle);
       float x1 = __half2float(xr[i]);
       float x2 = __half2float(xr[i + half]);
       xr[i] = __float2half(x1 * c - x2 * s);
       xr[i + half] = __float2half(x1 * s + x2 * c);
     }
+  }
+}
+
+// Fused residual-add + RMSNorm. Pass 1 accumulates the squared sum of
+// (hidden + residual); pass 2 writes both outputs. The second read of the
+// inputs hits L2, so the fusion trades one full DRAM round-trip for cheap
+// cache hits.
+__global__ void fused_residual_rmsnorm_kernel(__half* hidden,
+                                              const __half* residual,
+                                              __half* normed, const __half* w,
+                                              int size, float eps) {
+  int64_t base = static_cast<int64_t>(blockIdx.x) * size;
+  __half* h = hidden + base;
+  const __half* r = residual + base;
+  __half* n = normed + base;
+  float acc = 0.0f;
+  for (int i = threadIdx.x; i < size; i += blockDim.x) {
+    float v = __half2float(h[i]) + __half2float(r[i]);
+    acc += v * v;
+  }
+  acc = warp_reduce_sum(acc);
+  __shared__ float warp_sums[kBlock / 64];
+  if (threadIdx.x % 64 == 0) warp_sums[threadIdx.x / 64] = acc;
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    float total = 0.0f;
+    for (int i = 0; i < blockDim.x / 64; ++i) total += warp_sums[i];
+    warp_sums[0] = rsqrtf(total / size + eps);
+  }
+  __syncthreads();
+  float inv = warp_sums[0];
+  for (int i = threadIdx.x; i < size; i += blockDim.x) {
+    float v = __half2float(h[i]) + __half2float(r[i]);
+    h[i] = __float2half(v);
+    n[i] = __float2half(v * inv * __half2float(w[i]));
   }
 }
 
@@ -204,12 +241,24 @@ void rmsnorm_heads_fp16(void* out, const void* x, const void* weight, int rows,
 }
 
 void rope_fp16(void* x, int tokens, int heads, int head_dim, int row_stride,
-               int pos_offset, float theta, hipStream_t stream) {
+               int pos_offset, const void* inv_freq, hipStream_t stream) {
   int half = head_dim / 2;
   int block = half < kBlock ? (half + 63) / 64 * 64 : kBlock;
   hipLaunchKernelGGL(rope_kernel, dim3(tokens), dim3(block), 0, stream,
                      static_cast<__half*>(x), tokens, head_dim, heads,
-                     row_stride, pos_offset, theta);
+                     row_stride, pos_offset,
+                     static_cast<const float*>(inv_freq));
+}
+
+void fused_residual_rmsnorm_fp16(void* hidden_io, const void* residual,
+                                 void* normed, const void* weight, int rows,
+                                 int size, float eps, hipStream_t stream) {
+  int block = size < kBlock ? (size + 63) / 64 * 64 : kBlock;
+  hipLaunchKernelGGL(fused_residual_rmsnorm_kernel, dim3(rows), dim3(block), 0,
+                     stream, static_cast<__half*>(hidden_io),
+                     static_cast<const __half*>(residual),
+                     static_cast<__half*>(normed),
+                     static_cast<const __half*>(weight), size, eps);
 }
 
 void silu_and_mul_fp16(void* out, const void* x, int rows, int inner,
