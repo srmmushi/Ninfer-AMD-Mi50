@@ -115,6 +115,28 @@ MoERoutingPlan moe_route_cpu(const float* logits_device, int tokens, int experts
                              int top_k, Blas& blas, hipStream_t stream = 0);
 
 // ---------------------------------------------------------------------------
+// Decode-path GEMV (M == 1). rocBLAS is kept for prefill (M > 1); at M = 1 a
+// custom wave64 GEMV with LDS-staged activations matches DRAM bandwidth and
+// allows kernel-count fusion.
+// ---------------------------------------------------------------------------
+// y = W(N,K) · x(K): fp16 out.
+void gemv_fp16(void* y, const void* w, const void* x, int n_rows, int k_cols,
+               hipStream_t stream = 0);
+// y = W(N,K) · x(K): fp32 out (router / LM head).
+void gemv_fp32out(void* y, const void* w, const void* x, int n_rows, int k_cols,
+                  hipStream_t stream = 0);
+
+// Decode post-QKV fusion, ONE kernel replacing qk-norm ×2 + rope ×2 + KV
+// append ×2 (six launches): per-head blocks normalize (optional Qwen3
+// QK-norm), apply RoPE, and write K/V rows directly into the cache at pos0.
+// q is written back to the qkv buffer (rotated).
+void decode_post_qkv_fp16(void* qkv, void* k_cache, void* v_cache,
+                          const void* inv_freq, int pos0, int heads,
+                          int kv_heads, int head_dim, bool has_qknorm,
+                          const void* qn_weight, const void* kn_weight,
+                          float eps, hipStream_t stream = 0);
+
+// ---------------------------------------------------------------------------
 // Attention.
 // ---------------------------------------------------------------------------
 // Fused GQA decode for one sequence: out[H, D], q[H, D], cache [T, Hkv, D].

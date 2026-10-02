@@ -139,10 +139,14 @@ __global__ void prefill_attention_kernel(__half* out, const __half* q,
                                          int q_row_stride, int out_row_stride) {
   constexpr int BQ = 16;
   constexpr int BK = 32;
+  constexpr int EPT = BK * D / 256;  // K/V elements staged per thread
+  static_assert(BK * D % 256 == 0, "tile must split evenly across 256 threads");
+  // Double-buffered K/V tiles: tile t+1 is fetched into registers while tile
+  // t is consumed from LDS — the gfx906 substitute for cp.async pipelining.
   __shared__ float q_s[BQ][D];
   __shared__ float acc[BQ][D];
-  __shared__ __half k_s[BK][D];
-  __shared__ __half v_s[BK][D];
+  __shared__ __half k_s[2][BK][D];
+  __shared__ __half v_s[2][BK][D];
   __shared__ float s_s[BQ][BK];
   __shared__ float m_s[BQ], l_s[BQ], factor_s[BQ];
 
@@ -169,20 +173,38 @@ __global__ void prefill_attention_kernel(__half* out, const __half* q,
   }
   __syncthreads();
 
-  for (int k0 = 0; k0 < kv_len; k0 += BK) {
-    int kn = BK < (kv_len - k0) ? BK : (kv_len - k0);
-    // Stage the K/V tile into LDS (cooperative load).
-    for (int e = threadIdx.x; e < BK * D; e += blockDim.x) {
+  // Software pipeline: global -> registers -> LDS.
+  __half rk[EPT], rv[EPT];
+  auto load_regs = [&](int k0) {
+    for (int j = 0; j < EPT; ++j) {
+      int e = threadIdx.x + j * 256;
       int ki = e / D, d = e % D;
       int t = k0 + ki;
-      k_s[ki][d] =
-          (t < kv_len) ? kbase[static_cast<int64_t>(t) * kv_stride + d]
-                       : __float2half(0.0f);
-      v_s[ki][d] =
-          (t < kv_len) ? vbase[static_cast<int64_t>(t) * kv_stride + d]
-                       : __float2half(0.0f);
+      rk[j] = (t < kv_len) ? kbase[static_cast<int64_t>(t) * kv_stride + d]
+                           : __float2half(0.0f);
+      rv[j] = (t < kv_len) ? vbase[static_cast<int64_t>(t) * kv_stride + d]
+                           : __float2half(0.0f);
     }
-    __syncthreads();
+  };
+  auto store_regs = [&](int buf) {
+    for (int j = 0; j < EPT; ++j) {
+      int e = threadIdx.x + j * 256;
+      k_s[buf][e / D][e % D] = rk[j];
+      v_s[buf][e / D][e % D] = rv[j];
+    }
+  };
+
+  load_regs(0);
+  store_regs(0);
+  __syncthreads();
+  int cur = 0;
+
+  for (int k0 = 0; k0 < kv_len; k0 += BK) {
+    int kn = BK < (kv_len - k0) ? BK : (kv_len - k0);
+    int nxt = k0 + BK;
+    // Issue the next tile's global loads now; they overlap the LDS-bound
+    // score/accumulate work below (registers are only waited on at store).
+    if (nxt < kv_len) load_regs(nxt);
 
     // Scores for the BQ x BK sub-block; causal mask on absolute positions.
     for (int p = threadIdx.x; p < BQ * BK; p += blockDim.x) {
@@ -193,7 +215,7 @@ __global__ void prefill_attention_kernel(__half* out, const __half* q,
       float dot = 0.0f;
       if (valid) {
         for (int d = 0; d < D; ++d) {
-          dot += q_s[qi][d] * __half2float(k_s[ki][d]);
+          dot += q_s[qi][d] * __half2float(k_s[cur][ki][d]);
         }
       }
       s_s[qi][ki] = valid ? dot * scale : -INFINITY;
@@ -223,11 +245,14 @@ __global__ void prefill_attention_kernel(__half* out, const __half* q,
       int qi = e / D, d = e % D;
       float a = acc[qi][d] * factor_s[qi];
       for (int ki = 0; ki < kn; ++ki) {
-        a += s_s[qi][ki] * __half2float(v_s[ki][d]);
+        a += s_s[qi][ki] * __half2float(v_s[cur][ki][d]);
       }
       acc[qi][d] = a;
     }
     __syncthreads();
+    if (nxt < kv_len) store_regs(cur ^ 1);
+    __syncthreads();
+    cur ^= 1;
   }
 
   for (int e = threadIdx.x; e < BQ * D; e += blockDim.x) {

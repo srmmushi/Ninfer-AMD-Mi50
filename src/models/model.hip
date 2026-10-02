@@ -41,8 +41,8 @@ struct Model::Impl {
       DeviceBuffer wqkv_fused;  // [Hq*D + 2*Hkv*D, H] — Q/K/V concatenated at
                                 // load time so prefill issues ONE GEMM
       DeviceBuffer qn, kn;      // Qwen3 per-head q/k norms
-      DeviceBuffer gate, up, down;                    // dense FFN
-      DeviceBuffer moe_gate, moe_g, moe_u, moe_down;  // MoE [E, ...] stacked
+      DeviceBuffer gu, down;    // dense FFN: gu = [gate; up] fused [2I, H]
+      DeviceBuffer moe_gate, moe_gu, moe_down;  // MoE: gu per expert [E, 2I, H]
     };
     std::vector<Layer> lw;
 
@@ -173,12 +173,38 @@ struct Model::Impl {
         }
         if (cfg_local.is_moe) {
           L.moe_gate = load_fp16(ws, p + "mlp.gate.weight");
-          L.moe_g = load_fp16(ws, p + "mlp.experts.gate_proj.weight");
-          L.moe_u = load_fp16(ws, p + "mlp.experts.up_proj.weight");
+          // Per-expert gate/up fusion: [E, I, H] + [E, I, H] -> [E, 2I, H] so
+          // both prefill and decode issue ONE projection per expert.
+          DeviceBuffer tg = load_fp16(ws, p + "mlp.experts.gate_proj.weight", false);
+          DeviceBuffer tu = load_fp16(ws, p + "mlp.experts.up_proj.weight", false);
+          int E = cfg_local.num_experts;
+          size_t seg = static_cast<size_t>(I) * H * 2;
+          L.moe_gu.alloc(static_cast<size_t>(E) * 2 * I * H * 2);
+          weight_bytes += L.moe_gu.bytes();
+          for (int e = 0; e < E; ++e) {
+            HIP_CHECK(hipMemcpyAsync(
+                static_cast<char*>(L.moe_gu.data()) + e * 2 * seg,
+                static_cast<char*>(tg.data()) + e * seg, seg,
+                hipMemcpyDeviceToDevice, 0));
+            HIP_CHECK(hipMemcpyAsync(
+                static_cast<char*>(L.moe_gu.data()) + e * 2 * seg + seg,
+                static_cast<char*>(tu.data()) + e * seg, seg,
+                hipMemcpyDeviceToDevice, 0));
+          }
+          HIP_CHECK(hipStreamSynchronize(0));
           L.moe_down = load_fp16(ws, p + "mlp.experts.down_proj.weight");
         } else {
-          L.gate = load_fp16(ws, p + "mlp.gate_proj.weight");
-          L.up = load_fp16(ws, p + "mlp.up_proj.weight");
+          // Dense gate/up fusion: [I, H] + [I, H] -> [2I, H].
+          DeviceBuffer tg = load_fp16(ws, p + "mlp.gate_proj.weight", false);
+          DeviceBuffer tu = load_fp16(ws, p + "mlp.up_proj.weight", false);
+          size_t seg = static_cast<size_t>(I) * H * 2;
+          L.gu.alloc(seg * 2);
+          weight_bytes += L.gu.bytes();
+          HIP_CHECK(hipMemcpyAsync(L.gu.data(), tg.data(), seg,
+                                   hipMemcpyDeviceToDevice, 0));
+          HIP_CHECK(hipMemcpyAsync(static_cast<char*>(L.gu.data()) + seg,
+                                   tu.data(), seg, hipMemcpyDeviceToDevice, 0));
+          HIP_CHECK(hipStreamSynchronize(0));
           L.down = load_fp16(ws, p + "mlp.down_proj.weight");
         }
       }
@@ -247,63 +273,86 @@ struct Model::Impl {
         rmsnorm_fp16(normed.data(), hidden.data(), L.ln1.data(), T, H, eps,
                      stream);
 
-        // Fused QKV: single GEMM into the [T, wqkv] buffer.
-        blas->gemm_view(normed.data(), H, false, L.wqkv_fused.data(), H, true,
-                        qkv.data(), Hq * D + 2 * Hkv * D,
-                        Hq * D + 2 * Hkv * D, T, H, false, stream);
-
-        __half* qsec = static_cast<__half*>(qkv.data());
-        __half* ksec = qsec + Hq * D;
-        if (cfg_local.use_qk_norm) {
-          rmsnorm_heads_fp16(qsec, qsec, L.qn.data(), T, Hq, D,
-                             Hq * D + 2 * Hkv * D, eps, stream);
-          rmsnorm_heads_fp16(ksec, ksec, L.kn.data(), T, Hkv, D,
-                             Hq * D + 2 * Hkv * D, eps, stream);
-        }
-        rope_fp16(qsec, T, Hq, D, Hq * D + 2 * Hkv * D, pos0, rope_freq.data(),
-                  stream);
-        rope_fp16(ksec, T, Hkv, D, Hq * D + 2 * Hkv * D, pos0, rope_freq.data(),
-                  stream);
-
-        kv->append(li, pos0, qsec, qsec, Hq * D, (Hq + Hkv) * D,
-                   Hq * D + 2 * Hkv * D, T, stream);
-
+        const float attn_scale = 1.0f / std::sqrt(static_cast<float>(D));
         if (T == 1) {
-          attention_decode_fp16(attn_out.data(), qsec, kv->k_data(li),
-                                kv->v_data(li), pos0 + 1, Hq, Hkv, D,
-                                1.0f / std::sqrt(static_cast<float>(D)),
-                                stream);
+          // ---- Decode fast path (M = 1): custom GEMV + fused post-QKV.
+          // qkv GEMV, then ONE kernel for (optional qk-norm) + rope + KV
+          // append; attention over the cache.
+          gemv_fp16(qkv.data(), L.wqkv_fused.data(), normed.data(),
+                    Hq * D + 2 * Hkv * D, H, stream);
+          decode_post_qkv_fp16(
+              qkv.data(), kv->k_data(li), kv->v_data(li), rope_freq.data(),
+              pos0, Hq, Hkv, D, cfg_local.use_qk_norm,
+              cfg_local.use_qk_norm ? L.qn.data() : nullptr,
+              cfg_local.use_qk_norm ? L.kn.data() : nullptr, eps, stream);
+          attention_decode_fp16(attn_out.data(),
+                                static_cast<const __half*>(qkv.data()),
+                                kv->k_data(li), kv->v_data(li), pos0 + 1, Hq,
+                                Hkv, D, attn_scale, stream);
         } else {
-          // All heads in one fused flash kernel (LDS-staged K/V tiles,
-          // online softmax, no score scratch, no per-head launch storm).
+          // ---- Prefill path: fused QKV GEMM + per-token kernels.
+          blas->gemm_view(normed.data(), H, false, L.wqkv_fused.data(), H, true,
+                          qkv.data(), Hq * D + 2 * Hkv * D,
+                          Hq * D + 2 * Hkv * D, T, H, false, stream);
+          __half* qsec_p = static_cast<__half*>(qkv.data());
+          __half* ksec_p = qsec_p + Hq * D;
+          if (cfg_local.use_qk_norm) {
+            rmsnorm_heads_fp16(qsec_p, qsec_p, L.qn.data(), T, Hq, D,
+                               Hq * D + 2 * Hkv * D, eps, stream);
+            rmsnorm_heads_fp16(ksec_p, ksec_p, L.kn.data(), T, Hkv, D,
+                               Hq * D + 2 * Hkv * D, eps, stream);
+          }
+          rope_fp16(qsec_p, T, Hq, D, Hq * D + 2 * Hkv * D, pos0,
+                    rope_freq.data(), stream);
+          rope_fp16(ksec_p, T, Hkv, D, Hq * D + 2 * Hkv * D, pos0,
+                    rope_freq.data(), stream);
+          kv->append(li, pos0, qsec_p, qsec_p, Hq * D, (Hq + Hkv) * D,
+                     Hq * D + 2 * Hkv * D, T, stream);
+          // All heads in one fused flash kernel (LDS double-buffered K/V
+          // tiles, online softmax, no score scratch).
           attention_prefill_fused_fp16(
-              attn_out.data(), qsec, kv->k_data(li), kv->v_data(li), T,
+              attn_out.data(), qsec_p, kv->k_data(li), kv->v_data(li), T,
               pos0 + T, pos0, Hq, Hkv, D, Hq * D + 2 * Hkv * D, Hq * D,
-              1.0f / std::sqrt(static_cast<float>(D)), stream);
+              attn_scale, stream);
         }
 
         // o_proj + fused (residual add -> post-attention RMSNorm): the FFN
         // input is produced in the same pass that updates the residual
         // stream, saving one full [T, H] read+write per layer.
-        blas->gemm_view(attn_out.data(), Hq * D, false, L.wo.data(), H, true,
-                        proj.data(), H, H, T, Hq * D, false, stream);
+        if (T == 1) {
+          gemv_fp16(proj.data(), L.wo.data(), attn_out.data(), H, Hq * D,
+                    stream);
+        } else {
+          blas->gemm_view(attn_out.data(), Hq * D, false, L.wo.data(), H, true,
+                          proj.data(), H, H, T, Hq * D, false, stream);
+        }
         fused_residual_rmsnorm_fp16(hidden.data(), proj.data(), normed.data(),
                                     L.ln2.data(), T, H, eps, stream);
 
         if (!cfg_local.is_moe) {
-          blas->gemm_view(normed.data(), H, false, L.gate.data(), H, true,
-                          gate_up.data(), 2 * I, I, T, H, false, stream);
-          blas->gemm_view(normed.data(), H, false, L.up.data(), H, true,
-                          static_cast<__half*>(gate_up.data()) + I, 2 * I, I, T,
-                          H, false, stream);
-          silu_and_mul_fp16(act.data(), gate_up.data(), T, I, stream);
-          blas->gemm_view(act.data(), I, false, L.down.data(), I, true,
-                          proj.data(), H, H, T, I, false, stream);
+          if (T == 1) {
+            // Fused gate/up weight: one GEMV, then SwiGLU, then down GEMV.
+            gemv_fp16(gate_up.data(), L.gu.data(), normed.data(), 2 * I, H,
+                      stream);
+            silu_and_mul_fp16(act.data(), gate_up.data(), 1, I, stream);
+            gemv_fp16(proj.data(), L.down.data(), act.data(), H, I, stream);
+          } else {
+            blas->gemm_view(normed.data(), H, false, L.gu.data(), H, true,
+                            gate_up.data(), 2 * I, 2 * I, T, H, false, stream);
+            silu_and_mul_fp16(act.data(), gate_up.data(), T, I, stream);
+            blas->gemm_view(act.data(), I, false, L.down.data(), I, true,
+                            proj.data(), H, H, T, I, false, stream);
+          }
         } else {
           int E = cfg_local.num_experts;
           int topk = cfg_local.num_experts_per_tok;
-          blas->gemm_fp32out(normed.data(), L.moe_gate.data(),
-                             moe_logits.data(), T, E, H, stream);
+          if (T == 1) {
+            gemv_fp32out(moe_logits.data(), L.moe_gate.data(), normed.data(), E,
+                         H, stream);
+          } else {
+            blas->gemm_fp32out(normed.data(), L.moe_gate.data(),
+                               moe_logits.data(), T, E, H, stream);
+          }
           MoERoutingPlan plan = moe_route_cpu(
               static_cast<const float*>(moe_logits.data()), T, E, topk,
               *blas, stream);
@@ -321,24 +370,30 @@ struct Model::Impl {
             int64_t off = plan.expert_offsets[e];
             int64_t n = plan.expert_offsets[e + 1] - off;
             if (n <= 0) continue;
-            const __half* wg = static_cast<const __half*>(L.moe_g.data()) +
-                               static_cast<int64_t>(e) * I * H;
-            const __half* wu = static_cast<const __half*>(L.moe_u.data()) +
-                               static_cast<int64_t>(e) * I * H;
+            const __half* wgu = static_cast<const __half*>(L.moe_gu.data()) +
+                                static_cast<int64_t>(e) * 2 * I * H;
             const __half* wd = static_cast<const __half*>(L.moe_down.data()) +
                                static_cast<int64_t>(e) * H * I;
             __half* in = static_cast<__half*>(moe_perm.data()) + off * H;
             __half* gu = static_cast<__half*>(moe_gate_up.data()) + off * 2 * I;
-            blas->gemm_view(in, H, false, wg, H, true, gu, 2 * I, I,
-                            static_cast<int>(n), H, false, stream);
-            blas->gemm_view(in, H, false, wu, H, true, gu + I, 2 * I, I,
-                            static_cast<int>(n), H, false, stream);
+            if (T == 1) {
+              gemv_fp16(gu, wgu, in, 2 * I, H, stream);
+            } else {
+              blas->gemm_view(in, H, false, wgu, H, true, gu, 2 * I, 2 * I,
+                              static_cast<int>(n), H, false, stream);
+            }
             silu_and_mul_fp16(static_cast<__half*>(moe_act.data()) + off * I,
                               gu, static_cast<int>(n), I, stream);
             __half* eo = static_cast<__half*>(moe_eout.data()) + off * H;
-            blas->gemm_view(
-                static_cast<const __half*>(moe_act.data()) + off * I, I, false,
-                wd, I, true, eo, H, H, static_cast<int>(n), I, false, stream);
+            if (T == 1) {
+              gemv_fp16(eo, wd,
+                        static_cast<const __half*>(moe_act.data()) + off * I, H,
+                        I, stream);
+            } else {
+              blas->gemm_view(
+                  static_cast<const __half*>(moe_act.data()) + off * I, I, false,
+                  wd, I, true, eo, H, H, static_cast<int>(n), I, false, stream);
+            }
           }
           scale_rows_fp16(moe_eout.data(),
                           static_cast<const float*>(moe_w_dev.data()),
@@ -355,8 +410,13 @@ struct Model::Impl {
           __half* h_last = static_cast<__half*>(hidden.data()) + (T - 1) * H;
           __half* n_last = static_cast<__half*>(normed.data()) + (T - 1) * H;
           rmsnorm_fp16(n_last, h_last, final_norm.data(), 1, H, eps, stream);
-          blas->gemm_fp32out(n_last, lm_head.data(), logits_buf.data(), 1, V, H,
-                             stream);
+          if (T == 1) {
+            gemv_fp32out(logits_buf.data(), lm_head.data(), n_last, V, H,
+                         stream);
+          } else {
+            blas->gemm_fp32out(n_last, lm_head.data(), logits_buf.data(), 1, V,
+                               H, stream);
+          }
           return static_cast<const float*>(logits_buf.data());
         }
         residual_add_fp16(hidden.data(), proj.data(), T, H, stream);
@@ -376,6 +436,10 @@ struct Model::Impl {
   };
 
   std::vector<std::unique_ptr<Shard>> shards;
+
+  ~Impl() {
+    for (hipEvent_t e : boundary_events) (void)hipEventDestroy(e);
+  }
 
   // -------------------------------------------------------------------------
   void load(const std::string& dir) {
@@ -460,7 +524,20 @@ struct Model::Impl {
     HIP_CHECK(hipDeviceSynchronize());
     LOG_INFO("weights resident: %.2f GiB across %d device(s)",
              static_cast<double>(total) / (1024.0 * 1024.0 * 1024.0), n);
+
+    // One boundary event per shard pair: recorded on the producer's stream
+    // after its last kernel, awaited on the consumer's stream before the
+    // cross-device copy — no host-side device drains.
+    for (int i = 0; i + 1 < n; ++i) {
+      HIP_CHECK(hipEventCreate(&boundary_events.emplace_back()));
+    }
   }
+
+  // Cross-shard activation transfer, ordered entirely by GPU events:
+  //   producer stream --(event)--> consumer stream wait --> peer copy.
+  // This removes the two hipDeviceSynchronize() drains per forward that the
+  // naive pipeline needed, which dominated dual-GPU decode latency.
+  std::vector<hipEvent_t> boundary_events;
 
   const float* forward(const std::vector<int64_t>& tokens, int pos0,
                        hipStream_t /*stream*/) {
@@ -469,23 +546,18 @@ struct Model::Impl {
     for (size_t s = 0; s < shards.size(); ++s) {
       Shard& cur = *shards[s];
       if (s > 0) {
-        // Cross the shard boundary: wait for the producer device, copy the
-        // activations over PCIe (P2P when available), wait for completion.
         Shard& prev = *shards[s - 1];
-        {
-          DeviceGuard g(prev.device);
-          HIP_CHECK(hipDeviceSynchronize());
-        }
-        {
-          DeviceGuard g(cur.device);
-          HIP_CHECK(hipMemcpyPeerAsync(cur.hidden.data(), cur.device,
-                                       prev.hidden.data(), prev.device,
-                                       static_cast<size_t>(T) * H * 2, 0));
-          HIP_CHECK(hipDeviceSynchronize());
-        }
+        DeviceGuard g(cur.device);
+        HIP_CHECK(hipStreamWaitEvent(0, boundary_events[s - 1], 0));
+        HIP_CHECK(hipMemcpyPeerAsync(cur.hidden.data(), cur.device,
+                                     prev.hidden.data(), prev.device,
+                                     static_cast<size_t>(T) * H * 2, 0));
       }
       DeviceGuard g(cur.device);
       logits = cur.forward(tokens, pos0);
+      if (s + 1 < shards.size()) {
+        HIP_CHECK(hipEventRecord(boundary_events[s], 0));
+      }
     }
     return logits;
   }

@@ -89,12 +89,19 @@ Engine::Engine(const std::string& model_dir, const ModelOptions& options,
   tokenizer_ = std::make_unique<Tokenizer>(path_join(model_dir, "tokenizer.json"));
   model_ = std::make_unique<Model>(model_dir, options);
   const ModelConfig& c = model_->config();
+  // Page-locked staging buffer for the per-step logits D2H copy: avoids the
+  // pageable-memcpy staging alloc/free on every decode step.
+  HIP_CHECK(hipHostMalloc(&pinned_logits_,
+                          static_cast<size_t>(c.vocab_size) * sizeof(float),
+                          hipHostMallocDefault));
   LOG_INFO("engine ready: vocab=%d layers=%d ctx=%d chunk=%d gpus=%d",
            c.vocab_size, c.num_hidden_layers, options.max_context,
            options.prefill_chunk, model_->device_count());
 }
 
-Engine::~Engine() = default;
+Engine::~Engine() {
+  if (pinned_logits_) (void)hipHostFree(pinned_logits_);
+}
 
 std::vector<int64_t> Engine::tokenize(const std::string& text) const {
   return tokenizer_->encode(text);
@@ -138,16 +145,18 @@ std::string Engine::run(std::vector<int64_t> ids, const SamplingParams& sp,
     pos = end;
   }
 
-  // ---- Decode loop. Logits live on the last shard's device.
+  // ---- Decode loop. Logits live on the last shard's device; the copy lands
+  // in pinned host memory and sampling reads from there.
   for (int step = 0; step < sp.max_new_tokens; ++step) {
-    std::vector<float> logits(V);
     {
       DeviceGuard guard(model_->output_device());
       HIP_CHECK(hipStreamSynchronize(stream));
-      HIP_CHECK(hipMemcpy(logits.data(), logits_dev, V * sizeof(float),
-                          hipMemcpyDeviceToHost));
+      HIP_CHECK(hipMemcpyAsync(pinned_logits_, logits_dev, V * sizeof(float),
+                               hipMemcpyDeviceToHost, stream));
+      HIP_CHECK(hipStreamSynchronize(stream));
     }
-    int64_t next = sample_token(logits.data(), V, sp, ids, rng);
+    int64_t next = sample_token(static_cast<const float*>(pinned_logits_), V,
+                                sp, ids, rng);
 
     if (tokenizer_->is_special(next)) break;  // <|im_end|> etc.
     generated.push_back(next);
