@@ -1,5 +1,6 @@
 #include "ops/ops.h"
 
+#include <algorithm>
 #include <cmath>
 #include <stdexcept>
 #include <string>
@@ -52,43 +53,58 @@ __global__ void quantize_q4_kernel(const __half* w, uint8_t* packed,
 }
 
 // ---------------------------------------------------------------------------
-// Q4 GEMV (decode): one block per output row. x is staged through LDS in
-// kQ4Tile-element chunks; each thread owns one group (32 weights = one uint4
-// = 16 bytes of packed data) and accumulates dequant * x.
+// Q4 GEMV (decode): one block per output row.
+//
+// Each thread owns whole groups (32 weights == one uint4 == 16 packed bytes)
+// and streams both the packed weights and the matching activation slice with
+// vectorized (uint4) loads straight into registers — dequantization happens
+// in registers, there is no FP16 intermediate at all.
+//
+// Why no LDS staging of x (the previous version had it):
+//   * x is NOT shared between threads here (one group per thread), so staging
+//     only added a global -> LDS -> register round trip;
+//   * worse, each lane read a 32-element segment with stride 32, so for a
+//     given inner index every lane of a wave hit the SAME LDS bank: a 32-way
+//     bank conflict on gfx906;
+//   * it also needed two __syncthreads() per chunk.
 // ---------------------------------------------------------------------------
 template <bool F32OUT>
-__global__ void gemv_q4_kernel(__half* y16, float* y32, const uint8_t* packed,
-                               const __half* scales, const __half* x, int cols,
+__global__ void gemv_q4_kernel(__half* __restrict__ y16,
+                               float* __restrict__ y32,
+                               const uint8_t* __restrict__ packed,
+                               const __half* __restrict__ scales,
+                               const __half* __restrict__ x,
                                int groups_per_row) {
-  __shared__ __half x_s[kQ4Tile];
-  __shared__ float red[kQuantBlock / 64];
   int64_t n = blockIdx.x;
-  const uint4* qrow = reinterpret_cast<const uint4*>(
-      packed + n * static_cast<int64_t>(cols / 2));
-  const __half* srow = scales + n * static_cast<int64_t>(groups_per_row);
+  const uint4* __restrict__ qrow = reinterpret_cast<const uint4*>(
+      packed + n * static_cast<int64_t>(groups_per_row) * (kQ4Group / 2));
+  const __half* __restrict__ srow =
+      scales + n * static_cast<int64_t>(groups_per_row);
+  // 32 halves == 64 B == 4 uint4 per group.
+  const uint4* __restrict__ xrow = reinterpret_cast<const uint4*>(x);
+  __shared__ float red[kQuantBlock / 64];
   float acc = 0.0f;
 
-  for (int k0 = 0; k0 < cols; k0 += kQ4Tile) {
-    int chunk = kQ4Tile < (cols - k0) ? kQ4Tile : (cols - k0);
-    for (int i = threadIdx.x; i < chunk; i += blockDim.x) {
-      x_s[i] = x[k0 + i];
-    }
-    __syncthreads();
-    int g = k0 / kQ4Group + threadIdx.x;
-    if (g < groups_per_row && (g - k0 / kQ4Group) * kQ4Group < chunk) {
-      uint4 p = qrow[g];
-      float sc = __half2float(srow[g]);
-      uint32_t words[4] = {p.x, p.y, p.z, p.w};
-      int base = (g - k0 / kQ4Group) * kQ4Group;
-      for (int w = 0; w < 4; ++w) {
-        for (int j = 0; j < 8; ++j) {
-          int nib = static_cast<int>((words[w] >> (4 * j)) & 0xFu);
-          acc += (static_cast<float>(nib) - 8.0f) * sc *
-                 __half2float(x_s[base + w * 8 + j]);
-        }
+  for (int g = threadIdx.x; g < groups_per_row; g += blockDim.x) {
+    uint4 p = qrow[g];                 // 32 nibbles
+    float sc = __half2float(srow[g]);  // group scale
+    const uint4* xp = xrow + static_cast<int64_t>(g) * 4;
+    uint32_t nib_words[4] = {p.x, p.y, p.z, p.w};
+
+#pragma unroll
+    for (int w = 0; w < 4; ++w) {
+      uint4 xv = xp[w];  // 8 activation halves
+      uint32_t hwords[4] = {xv.x, xv.y, xv.z, xv.w};
+      uint32_t nib = nib_words[w];
+#pragma unroll
+      for (int j = 0; j < 8; ++j) {
+        int q = static_cast<int>((nib >> (4 * j)) & 0xFu);
+        uint16_t bits = static_cast<uint16_t>(
+            (hwords[j >> 1] >> (16 * (j & 1))) & 0xFFFFu);
+        acc += (static_cast<float>(q) - 8.0f) * sc *
+               __half2float(__ushort_as_half(bits));
       }
     }
-    __syncthreads();
   }
 
   acc = q4_warp_reduce(acc);
@@ -206,26 +222,30 @@ void quantize_q4_fp16(const void* w_fp16, void* packed, void* scales, int rows,
 void gemv_q4_fp16(void* y, const void* packed, const void* scales,
                   const void* x, int n_rows, int k_cols, hipStream_t stream) {
   if (n_rows <= 0) return;
-  hipLaunchKernelGGL((gemv_q4_kernel<false>), dim3(n_rows), dim3(kQuantBlock), 0,
+  // One thread per group; size the block to the actual group count so no wave
+  // sits idle (H=4096 -> 128 groups -> 2 waves instead of 4 half-empty ones).
+  int groups = k_cols / kQ4Group;
+  int block = std::min(kQuantBlock, (groups + 63) / 64 * 64);
+  hipLaunchKernelGGL((gemv_q4_kernel<false>), dim3(n_rows), dim3(block), 0,
                      stream, static_cast<__half*>(y),
                      static_cast<float*>(nullptr),
                      static_cast<const uint8_t*>(packed),
                      static_cast<const __half*>(scales),
-                     static_cast<const __half*>(x), k_cols,
-                     k_cols / kQ4Group);
+                     static_cast<const __half*>(x), groups);
 }
 
 void gemv_q4_fp32out(void* y, const void* packed, const void* scales,
                      const void* x, int n_rows, int k_cols,
                      hipStream_t stream) {
   if (n_rows <= 0) return;
-  hipLaunchKernelGGL((gemv_q4_kernel<true>), dim3(n_rows), dim3(kQuantBlock), 0,
+  int groups = k_cols / kQ4Group;
+  int block = std::min(kQuantBlock, (groups + 63) / 64 * 64);
+  hipLaunchKernelGGL((gemv_q4_kernel<true>), dim3(n_rows), dim3(block), 0,
                      stream, static_cast<__half*>(nullptr),
                      static_cast<float*>(y),
                      static_cast<const uint8_t*>(packed),
                      static_cast<const __half*>(scales),
-                     static_cast<const __half*>(x), k_cols,
-                     k_cols / kQ4Group);
+                     static_cast<const __half*>(x), groups);
 }
 
 void gemm_q4_fp16(void* out, const void* x, const void* packed,
