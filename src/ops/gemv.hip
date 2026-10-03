@@ -1,5 +1,6 @@
 #include "ops/ops.h"
 
+#include <algorithm>
 #include <cmath>
 #include <stdexcept>
 #include <string>
@@ -24,6 +25,74 @@ __device__ inline float gemv_warp_reduce(float v) {
 //   mode 0: y16[n] = acc            (fp16 out)
 //   mode 1: y16[n] += acc           (unused; kept for symmetry)
 //   mode 2: y32[n] = acc            (fp32 out: router, LM head)
+__device__ inline void gemv_unpack8(const uint4& v, float out[8]) {
+  uint32_t words[4] = {v.x, v.y, v.z, v.w};
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    out[2 * i] =
+        __half2float(__ushort_as_half(static_cast<uint16_t>(words[i] & 0xFFFFu)));
+    out[2 * i + 1] =
+        __half2float(__ushort_as_half(static_cast<uint16_t>(words[i] >> 16)));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Vectorized wave64 GEMV (decode fast path).
+// One block per output row; every thread consumes 8 halves (one uint4 = 16 B)
+// of both the weight row and the activation, unpacks them in registers and
+// accumulates in FP32.
+//   * 8x fewer memory instructions than the scalar version (16 B per load
+//     instead of 2 B), and 32 lanes x 16 B covers full cachelines;
+//   * no LDS staging: x is not shared between threads here, so the previous
+//     global -> LDS -> register path was pure overhead plus two barriers per
+//     chunk; the only shared memory left is the final warp reduction.
+// Used when K % 8 == 0 (all real Qwen shapes); the scalar kernel below stays
+// as the fallback.
+// ---------------------------------------------------------------------------
+template <bool F32OUT>
+__global__ void gemv_kernel_vec8(__half* __restrict__ y16,
+                                 float* __restrict__ y32,
+                                 const __half* __restrict__ w,
+                                 const __half* __restrict__ x, int vec8_count,
+                                 int K) {
+  int64_t n = blockIdx.x;
+  const uint4* __restrict__ wrow =
+      reinterpret_cast<const uint4*>(w + n * static_cast<int64_t>(K));
+  const uint4* __restrict__ xrow = reinterpret_cast<const uint4*>(x);
+  __shared__ float red[kGemvBlock / 64];
+  float acc = 0.0f;
+
+  for (int i = threadIdx.x; i < vec8_count; i += blockDim.x) {
+    uint4 wv = wrow[i];
+    uint4 xv = xrow[i];
+    float wf[8], xf[8];
+    gemv_unpack8(wv, wf);
+    gemv_unpack8(xv, xf);
+#pragma unroll
+    for (int j = 0; j < 8; ++j) acc += wf[j] * xf[j];
+  }
+  // Scalar tail for K not divisible by 8 (vectorized path already covers
+  // the aligned bulk).
+  for (int k = vec8_count * 8 + threadIdx.x; k < K; k += blockDim.x) {
+    acc += __half2float(w[n * static_cast<int64_t>(K) + k]) *
+           __half2float(x[k]);
+  }
+
+  acc = gemv_warp_reduce(acc);
+  if (threadIdx.x % 64 == 0) red[threadIdx.x / 64] = acc;
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    float total = 0.0f;
+    for (int i = 0; i < blockDim.x / 64; ++i) total += red[i];
+    if (F32OUT) {
+      y32[n] = total;
+    } else {
+      y16[n] = __float2half(total);
+    }
+  }
+}
+
+// Scalar fallback (K % 8 != 0): LDS-staged activation, one element per load.
 __global__ void gemv_kernel(__half* y16, float* y32, const __half* w,
                             const __half* x, int K, int mode) {
   int64_t n = blockIdx.x;
@@ -187,6 +256,17 @@ __global__ void post_qkv_kernel(__half* qkv, __half* kc, __half* vc,
 void gemv_fp16(void* y, const void* w, const void* x, int n_rows, int k_cols,
                hipStream_t stream) {
   if (n_rows <= 0) return;
+  if (k_cols % 8 == 0) {
+    int vec8 = k_cols / 8;
+    // Size the block to the actual vector count so no wave idles.
+    int block = std::min(kGemvBlock, (vec8 + 63) / 64 * 64);
+    hipLaunchKernelGGL((gemv_kernel_vec8<false>), dim3(n_rows), dim3(block), 0,
+                       stream, static_cast<__half*>(y),
+                       static_cast<float*>(nullptr),
+                       static_cast<const __half*>(w),
+                       static_cast<const __half*>(x), vec8, k_cols);
+    return;
+  }
   hipLaunchKernelGGL(gemv_kernel, dim3(n_rows), dim3(kGemvBlock), 0, stream,
                      static_cast<__half*>(y), static_cast<float*>(nullptr),
                      static_cast<const __half*>(w),
@@ -196,6 +276,15 @@ void gemv_fp16(void* y, const void* w, const void* x, int n_rows, int k_cols,
 void gemv_fp32out(void* y, const void* w, const void* x, int n_rows, int k_cols,
                   hipStream_t stream) {
   if (n_rows <= 0) return;
+  if (k_cols % 8 == 0) {
+    int vec8 = k_cols / 8;
+    int block = std::min(kGemvBlock, (vec8 + 63) / 64 * 64);
+    hipLaunchKernelGGL((gemv_kernel_vec8<true>), dim3(n_rows), dim3(block), 0,
+                       stream, static_cast<__half*>(nullptr),
+                       static_cast<float*>(y), static_cast<const __half*>(w),
+                       static_cast<const __half*>(x), vec8, k_cols);
+    return;
+  }
   hipLaunchKernelGGL(gemv_kernel, dim3(n_rows), dim3(kGemvBlock), 0, stream,
                      static_cast<__half*>(nullptr), static_cast<float*>(y),
                      static_cast<const __half*>(w),
