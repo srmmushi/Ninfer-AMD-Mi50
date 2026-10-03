@@ -157,6 +157,59 @@ PYTHONPATH=tools python3 tools/demo_ninfer_capi.py \
 executes them in a single forward pass — the continuous-batching primitive a
 PagedAttention scheduler needs.
 
+### vLLM worker patch (real backend replacement)
+
+`tools/vllm_plugin/` installs a backend plugin into a
+[gfx906-vllm](https://github.com/ttdxq/gfx906-vllm) checkout: vLLM keeps
+scheduling, sampling and the HTTP surface, while every scheduled step is
+executed by the HIP engine through the C API.
+
+```bash
+./tools/vllm_plugin/install.sh ~/gfx906-vllm
+
+export NINFER_LIB=$PWD/build/libninfer.so
+cd ~/gfx906-vllm
+HIP_VISIBLE_DEVICES=0,1 \
+NINFER_MODEL=/data/models/Qwen3-14B NINFER_GPUS=0,1 \
+NINFER_QUANT=q4 NINFER_PARALLEL=pp NINFER_SEQUENCES=8 \
+vllm serve Qwen3-14B --port 8000 --max-model-len 32768
+```
+
+Patched integration points (`ninfer_vllm_patch.py`):
+`Worker.determine_available_memory` / `Worker.initialize_cache` (report the
+engine's KV footprint instead of allocating a torch KV cache),
+`ModelRunner.load_model` (weights live in HIP — no torch module),
+`ModelRunner.execute_model` (prefill via `ninfer_prefill`, running batch via
+`ninfer_decode_batch`). Unset `NINFER_MODEL` to fall back to stock vLLM.
+
+Known limits: no true PagedAttention (one contiguous slab per sequence → no
+prefix sharing / block reuse yet), dense models only, chunked prefill and
+speculative decoding not wired through.
+
+## Weight format: Q4 groupwise quantization
+
+`--quant q4` quantizes weights at load time (symmetric per-group-of-32 INT4,
+FP32 accumulation, dequantized inside the GEMM/GEMV) — ~4x less weight traffic,
+which is the dominant cost in decode:
+
+* 27B FP16 ≈ 54 GB → Q4 ≈ 14 GB (fits 2×16 GB Radeon VII)
+* decode ceiling goes from ~19 tok/s (FP16, dual MI50) to a bandwidth-bound
+  ~68 tok/s in theory; expect ~30–45 tok/s in practice
+
+```bash
+./build/ninfer /path/to/Qwen3-27B --quant q4 --gpus 0,1 --prompt "..." --max-new 256
+```
+
+## Parallelism modes
+
+| `--parallel` | Layout | Notes |
+|---|---|---|
+| `pp` (default) | layers split across GPUs (pipeline); activation crosses once per forward | halves per-card memory; decode bandwidth is **not** doubled |
+| `tp` | Megatron-style tensor parallel: q/k/v and gate/up row-split, o_proj/down column-split, 2 all-reduces per layer | halves per-token weight traffic → up to ~2x decode; dense models only |
+
+Both modes are ordered purely by HIP events (no host device drains). MoE is
+supported in `pp` only.
+
 ## Architecture
 
 ```
