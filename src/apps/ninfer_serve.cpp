@@ -31,6 +31,7 @@ struct ServeOptions {
   std::vector<int> gpu_ids = {0};
   std::string quant = "fp16";
   std::string parallel = "pp";
+  bool graph = false;   // opt-in HIP graph decode (single-GPU dense only)
 };
 
 ServeOptions parse(int argc, char** argv) {
@@ -39,7 +40,8 @@ ServeOptions parse(int argc, char** argv) {
     throw std::runtime_error(
         "usage: ninfer-serve <model_dir> [--port N] [--max-context N] "
         "[--prefill-chunk N] [--gpus 0,1] [--no-thinking] [--temperature F] "
-        "[--top-k N] [--top-p F] [--repeat-penalty F] [--log-level LEVEL]");
+        "[--top-k N] [--top-p F] [--repeat-penalty F] [--graph] "
+        "[--log-level LEVEL]");
   }
   o.model_dir = argv[1];
   for (int i = 2; i < argc; ++i) {
@@ -69,8 +71,9 @@ ServeOptions parse(int argc, char** argv) {
       }
       if (!item.empty()) o.gpu_ids.push_back(std::stoi(item));
       if (o.gpu_ids.empty()) throw std::runtime_error("empty --gpus list");
-    } else if (a == "--quant") o.quant = next();
+    }     else if (a == "--quant") o.quant = next();
     else if (a == "--parallel") o.parallel = next();
+    else if (a == "--graph") o.graph = true;
     else if (a == "--log-level") {
       std::string lv = next();
       if (lv == "debug") global_log_level() = LogLevel::Debug;
@@ -217,6 +220,7 @@ int main(int argc, char** argv) {
     mo.gpu_ids = o.gpu_ids;
     mo.quant = o.quant;
     mo.parallel = o.parallel;
+    mo.use_graph = o.graph;
     Engine engine(o.model_dir, mo, !o.no_thinking);
     std::mutex gen_mutex;
 

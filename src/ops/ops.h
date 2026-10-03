@@ -141,9 +141,11 @@ void gemv_fp32out(void* y, const void* w, const void* x, int n_rows, int k_cols,
 // Decode post-QKV fusion, ONE kernel replacing qk-norm ×2 + rope ×2 + KV
 // append ×2 (six launches): per-head blocks normalize (optional Qwen3
 // QK-norm), apply RoPE, and write K/V rows directly into the cache at pos0.
-// q is written back to the qkv buffer (rotated).
+// q is written back to the qkv buffer (rotated). pos_ptr points to a device
+// int holding the current decode position (used for RoPE and the KV write
+// offset) so the decode step is argument-stable for HIP graph capture.
 void decode_post_qkv_fp16(void* qkv, void* k_cache, void* v_cache,
-                          const void* inv_freq, int pos0, int heads,
+                          const void* inv_freq, const void* pos_ptr, int heads,
                           int kv_heads, int head_dim, bool has_qknorm,
                           const void* qn_weight, const void* kn_weight,
                           float eps, hipStream_t stream = 0);
@@ -209,8 +211,12 @@ void gemm_q4_fp16(void* out, const void* x, const void* packed,
 // Attention.
 // ---------------------------------------------------------------------------
 // Fused GQA decode for one sequence: out[H, D], q[H, D], cache [T, Hkv, D].
+// pos_ptr points to a device int holding the current decode position; the
+// effective KV length is (*pos_ptr) + 1. Taking a device pointer (rather than
+// an int) keeps the decode step argument-stable so it can be HIP-graph
+// captured.
 void attention_decode_fp16(void* out, const void* q, const void* k_cache,
-                           const void* v_cache, int kv_len, int heads,
+                           const void* v_cache, const void* pos_ptr, int heads,
                            int kv_heads, int head_dim, float scale,
                            hipStream_t stream = 0);
 

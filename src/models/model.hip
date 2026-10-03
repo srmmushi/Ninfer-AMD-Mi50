@@ -223,7 +223,7 @@ struct Model::Impl {
         linear(qkv.data(), L.wqkv_fused, normed.data(), 1, false);
         decode_post_qkv_fp16(
             qkv.data(), kv->k_data(li, groups[0].seq),
-            kv->v_data(li, groups[0].seq), rope_freq.data(), groups[0].pos0,
+            kv->v_data(li, groups[0].seq), rope_freq.data(), pos_dev.data(),
             Hql, Hkvl, D, use_qknorm, L.qn.fp.data(), L.kn.fp.data(), eps,
             stream);
       } else {
@@ -258,7 +258,7 @@ struct Model::Impl {
       if (tp_decode_single) {
         decode_post_qkv_fp16(qkv.data(), kv->k_data(li, groups[0].seq),
                              kv->v_data(li, groups[0].seq), rope_freq.data(),
-                             groups[0].pos0, Hql, Hkvl, D, use_qknorm,
+                             pos_dev.data(), Hql, Hkvl, D, use_qknorm,
                              L.qn.fp.data(), L.kn.fp.data(), eps, stream);
       } else if (tp_mode) {
         if (all_single) {
@@ -289,9 +289,10 @@ struct Model::Impl {
         __half* out_row = static_cast<__half*>(attn_out.data()) +
                           static_cast<int64_t>(g.start) * Hql * D;
         if (g.count == 1) {
-          attention_decode_fp16(out_row, q_row, kv->k_data(li, g.seq),
-                                kv->v_data(li, g.seq), g.pos0 + 1, Hql, Hkvl, D,
-                                scale, stream);
+          attention_decode_fp16(
+              out_row, q_row, kv->k_data(li, g.seq), kv->v_data(li, g.seq),
+              static_cast<const int*>(pos_dev.data()) + g.start, Hql, Hkvl, D,
+              scale, stream);
         } else {
           attention_prefill_fused_fp16(out_row, q_row, kv->k_data(li, g.seq),
                                        kv->v_data(li, g.seq), g.count,
@@ -698,18 +699,27 @@ struct Model::Impl {
                     const std::vector<int>& seq_ids) {
       hipStream_t stream = 0;
       int T = static_cast<int>(tokens.size());
+      // During capture skip the host->device uploads: the token/position are
+      // fed through device buffers from outside the captured graph, but the
+      // gather/rope kernels still run (they read stable device pointers).
       if (owns_embed) {
-        HIP_CHECK(hipMemcpyAsync(ids_dev.data(), tokens.data(),
-                                 T * sizeof(int64_t), hipMemcpyHostToDevice,
-                                 stream));
+        if (!skip_upload) {
+          HIP_CHECK(hipMemcpyAsync(ids_dev.data(), tokens.data(),
+                                   T * sizeof(int64_t), hipMemcpyHostToDevice,
+                                   stream));
+        }
         embed_gather_fp16(hidden.data(), embed.fp.data(),
                           static_cast<const int64_t*>(ids_dev.data()), T, Hdim,
                           stream);
       }
-      HIP_CHECK(hipMemcpyAsync(pos_dev.data(), positions.data(),
-                               T * sizeof(int), hipMemcpyHostToDevice, stream));
-      HIP_CHECK(hipMemcpyAsync(seq_dev.data(), seq_ids.data(),
-                               T * sizeof(int), hipMemcpyHostToDevice, stream));
+      if (!skip_upload) {
+        HIP_CHECK(hipMemcpyAsync(pos_dev.data(), positions.data(),
+                                 T * sizeof(int), hipMemcpyHostToDevice,
+                                 stream));
+        HIP_CHECK(hipMemcpyAsync(seq_dev.data(), seq_ids.data(),
+                                 T * sizeof(int), hipMemcpyHostToDevice,
+                                 stream));
+      }
     }
 
     // ---- logits for the last row of every group (head shard only) ----
@@ -751,11 +761,73 @@ struct Model::Impl {
   std::vector<hipEvent_t> tp_events;        // tp: compute done, one per rank
   std::vector<hipEvent_t> tp_done_events;   // tp: all-reduce copy done
 
+  // HIP graph decode (opt-in). capturing_ lets begin_rows skip host uploads so
+  // the captured graph stays argument-stable; the token/position are fed from
+  // outside via device buffers (set_decode_token / set_position).
+  bool capturing_ = false;
+  hipGraphExec_t graph_exec_ = nullptr;
+
   ~Impl() {
+    release_decode_graph();
     for (hipEvent_t e : boundary_events) (void)hipEventDestroy(e);
     for (hipEvent_t e : tp_events) (void)hipEventDestroy(e);
     for (hipEvent_t e : tp_done_events) (void)hipEventDestroy(e);
   }
+
+  void release_decode_graph() {
+    if (graph_exec_) (void)hipGraphExecDestroy(graph_exec_);
+    graph_exec_ = nullptr;
+  }
+
+  // Capture the single-token decode path for the dense, single-GPU case. Returns
+  // false when unsupported (multi-GPU pipeline / tensor-parallel, or MoE — the
+  // latter still issues a host sync during routing).
+  bool capture_decode_graph() {
+    if (shards.size() != 1) return false;  // multi-GPU is not argument-stable
+    if (cfg.is_moe) return false;
+    release_decode_graph();
+    HIP_CHECK(hipStreamSynchronize(0));
+    hipError_t e = hipStreamBeginCapture(0, hipStreamCaptureModeRelaxed);
+    if (e != hipSuccess) return false;
+    // During capture the kernels are only recorded, not executed, so the device
+    // position/token buffers need no valid contents here. Their real values are
+    // supplied from outside the graph (set_decode_token / set_position) before
+    // each replay.
+    capturing_ = true;
+    std::vector<int64_t> toks(1, 0);
+    std::vector<int> pos(1, 0), seqs(1, 0);
+    forward_batch(toks, pos, seqs, 0);
+    capturing_ = false;
+    hipGraph_t graph = nullptr;
+    e = hipStreamEndCapture(0, &graph);
+    if (e != hipSuccess || graph == nullptr) return false;
+    hipGraphExec_t exec = nullptr;
+    e = hipGraphInstantiate(&exec, graph, nullptr, nullptr, 0);
+    hipGraphDestroy(graph);
+    if (e != hipSuccess || exec == nullptr) return false;
+    graph_exec_ = exec;
+    return true;
+  }
+
+  void launch_decode_graph() {
+    if (graph_exec_) HIP_CHECK(hipGraphLaunch(graph_exec_, 0));
+  }
+
+  // Feed the decode token / position from outside the captured graph. These are
+  // plain (non-captured) uploads ordered before the next hipGraphLaunch.
+  void set_decode_token(int64_t token) {
+    if (shards.empty() || !shards[0]->owns_embed) return;
+    HIP_CHECK(hipMemcpyAsync(shards[0]->ids_dev.data(), &token,
+                             sizeof(int64_t), hipMemcpyHostToDevice, 0));
+  }
+
+  void set_position(int pos) {
+    if (shards.empty()) return;
+    int p = pos;
+    HIP_CHECK(hipMemcpyAsync(shards[0]->pos_dev.data(), &p, sizeof(int),
+                             hipMemcpyHostToDevice, 0));
+  }
+
 
   void load(const std::string& dir) {
     cfg = ModelConfig::from_file(path_join(dir, "config.json"));
@@ -944,7 +1016,7 @@ struct Model::Impl {
                                        static_cast<size_t>(T) * H * 2, 0));
         }
         DeviceGuard g(cur.device);
-        cur.begin_rows(tokens, positions, seq_ids);
+        cur.begin_rows(tokens, positions, seq_ids, capturing_);
         for (int li = 0; li < static_cast<int>(cur.lw.size()); ++li) {
           cur.layer_start(li, groups, T, all_single, false);
           cur.layer_mid(li, T);
@@ -962,7 +1034,7 @@ struct Model::Impl {
     // with an all-reduce after o_proj and after down_proj.
     for (auto& s : shards) {
       DeviceGuard g(s->device);
-      s->begin_rows(tokens, positions, seq_ids);
+      s->begin_rows(tokens, positions, seq_ids, capturing_);
     }
     int nlayers = static_cast<int>(shards[0]->lw.size());
     for (int li = 0; li < nlayers; ++li) {
@@ -1043,5 +1115,12 @@ const float* Model::forward(const std::vector<int64_t>& tokens, int pos0,
   ForwardOutput out = impl_->forward_batch(tokens, positions, seq_ids, stream);
   return out.logits;
 }
+
+bool Model::capture_decode_graph() { return impl_->capture_decode_graph(); }
+void Model::launch_decode_graph() { impl_->launch_decode_graph(); }
+void Model::set_decode_token(int64_t token) { impl_->set_decode_token(token); }
+void Model::set_position(int pos) { impl_->set_position(pos); }
+bool Model::graph_enabled() const { return impl_->graph_exec_ != nullptr; }
+void Model::release_decode_graph() { impl_->release_decode_graph(); }
 
 }  // namespace ninfer

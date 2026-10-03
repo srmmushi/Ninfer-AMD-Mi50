@@ -85,7 +85,7 @@ int64_t sample_logits(const float* logits, int vocab, const SamplingParams& sp,
 
 Engine::Engine(const std::string& model_dir, const ModelOptions& options,
                bool enable_thinking)
-    : renderer_(enable_thinking) {
+    : renderer_(enable_thinking), opt_(options) {
   init_device();
   tokenizer_ = std::make_unique<Tokenizer>(path_join(model_dir, "tokenizer.json"));
   model_ = std::make_unique<Model>(model_dir, options);
@@ -148,6 +148,13 @@ std::string Engine::run(std::vector<int64_t> ids, const SamplingParams& sp,
 
   // ---- Decode loop. Logits live on the last shard's device; the copy lands
   // in pinned host memory and sampling reads from there.
+  // Optionally capture the single-token decode path into a HIP graph to skip
+  // per-kernel launch overhead; the token/position are fed from outside it.
+  if (opt_.use_graph && model_->device_count() == 1) {
+    model_->capture_decode_graph();
+  }
+  bool graph_on = model_->graph_enabled();
+
   for (int step = 0; step < sp.max_new_tokens; ++step) {
     {
       DeviceGuard guard(model_->output_device());
@@ -178,7 +185,16 @@ std::string Engine::run(std::vector<int64_t> ids, const SamplingParams& sp,
     }
 
     if (step + 1 < sp.max_new_tokens) {
-      logits_dev = model_->forward({next}, pos, stream);
+      if (graph_on) {
+        // Feed the next token and its absolute position through device buffers
+        // (outside the captured graph), then replay the graph. logits_dev still
+        // points at the model's logits buffer, which the replay overwrites.
+        model_->set_decode_token(next);
+        model_->set_position(pos);
+        model_->launch_decode_graph();
+      } else {
+        logits_dev = model_->forward({next}, pos, stream);
+      }
       pos += 1;
     }
   }

@@ -269,13 +269,14 @@ __global__ void post_qkv_batch_kernel(__half* qkv, __half* kc, __half* vc,
 // Replaces 6 separate launches with 1 on the decode path.
 // ---------------------------------------------------------------------------
 __global__ void post_qkv_kernel(__half* qkv, __half* kc, __half* vc,
-                                const float* inv_freq, int pos0, int Hq,
-                                int Hkv, int D, int has_qknorm,
+                                const float* inv_freq, const int* pos_ptr,
+                                int Hq, int Hkv, int D, int has_qknorm,
                                 const __half* qn, const __half* kn, float eps) {
   int hb = blockIdx.x;   // 0 .. Hq + 2*Hkv - 1
   int d = threadIdx.x;   // blockDim == D
   __shared__ float red[2];
   int half = D / 2;
+  int pos0 = *pos_ptr;
   bool is_q = hb < Hq;
   bool is_k = !is_q && hb < Hq + Hkv;
   int kvh = is_q ? 0 : (is_k ? hb - Hq : hb - Hq - Hkv);
@@ -429,16 +430,17 @@ void decode_post_qkv_batch_fp16(void* qkv, void* k_base, void* v_base,
 }
 
 void decode_post_qkv_fp16(void* qkv, void* k_cache, void* v_cache,
-                          const void* inv_freq, int pos0, int heads,
+                          const void* inv_freq, const void* pos_ptr, int heads,
                           int kv_heads, int head_dim, bool has_qknorm,
                           const void* qn_weight, const void* kn_weight,
                           float eps, hipStream_t stream) {
   int blocks = heads + 2 * kv_heads;
+  const int* pp = static_cast<const int*>(pos_ptr);
   if (head_dim == 128) {
     hipLaunchKernelGGL(post_qkv_kernel, dim3(blocks), dim3(128), 0, stream,
                        static_cast<__half*>(qkv), static_cast<__half*>(k_cache),
                        static_cast<__half*>(v_cache),
-                       static_cast<const float*>(inv_freq), pos0, heads,
+                       static_cast<const float*>(inv_freq), pp, heads,
                        kv_heads, head_dim, has_qknorm ? 1 : 0,
                        static_cast<const __half*>(qn_weight),
                        static_cast<const __half*>(kn_weight), eps);
@@ -446,7 +448,7 @@ void decode_post_qkv_fp16(void* qkv, void* k_cache, void* v_cache,
     hipLaunchKernelGGL(post_qkv_kernel, dim3(blocks), dim3(64), 0, stream,
                        static_cast<__half*>(qkv), static_cast<__half*>(k_cache),
                        static_cast<__half*>(v_cache),
-                       static_cast<const float*>(inv_freq), pos0, heads,
+                       static_cast<const float*>(inv_freq), pp, heads,
                        kv_heads, head_dim, has_qknorm ? 1 : 0,
                        static_cast<const __half*>(qn_weight),
                        static_cast<const __half*>(kn_weight), eps);

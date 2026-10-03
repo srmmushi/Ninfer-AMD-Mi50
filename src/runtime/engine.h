@@ -59,6 +59,7 @@ class Engine {
   std::unique_ptr<Model> model_;
   std::unique_ptr<Tokenizer> tokenizer_;
   ChatRenderer renderer_;
+  ModelOptions opt_;                // stored so the decode loop can see use_graph
   void* pinned_logits_ = nullptr;  // page-locked logits staging buffer
 };
 

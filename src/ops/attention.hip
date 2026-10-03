@@ -14,8 +14,8 @@ namespace {
 template <int D>
 __global__ void decode_attention_kernel(__half* out, const __half* q,
                                         const __half* kc, const __half* vc,
-                                        int kv_len, int heads, int kv_heads,
-                                        float scale) {
+                                        const int* pos_ptr, int heads,
+                                        int kv_heads, float scale) {
   constexpr int kTile = 256;
   __shared__ float q_s[D];
   __shared__ float acc[D];
@@ -28,6 +28,7 @@ __global__ void decode_attention_kernel(__half* out, const __half* q,
   int kvh = h / group;
   const __half* kbase = kc + static_cast<int64_t>(kvh) * D;
   const __half* vbase = vc + static_cast<int64_t>(kvh) * D;
+  int kv_len = *pos_ptr + 1;
 
   if (threadIdx.x < D) {
     q_s[threadIdx.x] = __half2float(q[static_cast<int64_t>(h) * D + threadIdx.x]);
@@ -101,23 +102,24 @@ __global__ void cast_fp32_fp16_kernel(__half* dst, const float* src,
 }  // namespace
 
 void attention_decode_fp16(void* out, const void* q, const void* k_cache,
-                           const void* v_cache, int kv_len, int heads,
+                           const void* v_cache, const void* pos_ptr, int heads,
                            int kv_heads, int head_dim, float scale,
                            hipStream_t stream) {
+  const int* pp = static_cast<const int*>(pos_ptr);
   if (head_dim == 128) {
     hipLaunchKernelGGL((decode_attention_kernel<128>), dim3(heads), dim3(256), 0,
                        stream, static_cast<__half*>(out),
                        static_cast<const __half*>(q),
                        static_cast<const __half*>(k_cache),
-                       static_cast<const __half*>(v_cache), kv_len, heads,
-                       kv_heads, scale);
+                       static_cast<const __half*>(v_cache), pp, heads, kv_heads,
+                       scale);
   } else if (head_dim == 64) {
     hipLaunchKernelGGL((decode_attention_kernel<64>), dim3(heads), dim3(256), 0,
                        stream, static_cast<__half*>(out),
                        static_cast<const __half*>(q),
                        static_cast<const __half*>(k_cache),
-                       static_cast<const __half*>(v_cache), kv_len, heads,
-                       kv_heads, scale);
+                       static_cast<const __half*>(v_cache), pp, heads, kv_heads,
+                       scale);
   } else {
     throw std::runtime_error(
         "unsupported head_dim for gfx906 decode attention: " +

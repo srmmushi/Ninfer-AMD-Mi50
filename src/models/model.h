@@ -43,6 +43,10 @@ struct ModelOptions {
   std::string quant = "fp16";
   // "pp" = layer-split pipeline, "tp" = tensor parallel (dense models).
   std::string parallel = "pp";
+  // Opt-in HIP graph decode: capture the single-token decode path once and
+  // replay it to eliminate per-kernel launch overhead. Default off so --verify
+  // and existing runs are unaffected; enable with --graph.
+  bool use_graph = false;
 };
 
 struct ForwardOutput {
@@ -74,6 +78,18 @@ class Model {
 
   const float* forward(const std::vector<int64_t>& tokens, int pos0,
                        hipStream_t stream);
+
+  // ---- Opt-in HIP graph decode (see ModelOptions::use_graph) ----
+  // Captures the single-token decode path (dense, single-GPU) once. Returns
+  // false if unsupported (multi-GPU / MoE). The position and input token are
+  // fed through device buffers outside the captured graph, so replays stay
+  // argument-stable.
+  bool capture_decode_graph();
+  void launch_decode_graph();
+  void set_decode_token(int64_t token);  // upload input token (outside graph)
+  void set_position(int pos);            // upload decode position (outside graph)
+  bool graph_enabled() const;
+  void release_decode_graph();
 
   int output_device() const;
   size_t weight_bytes() const;
