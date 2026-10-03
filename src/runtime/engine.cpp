@@ -81,8 +81,6 @@ int64_t sample_logits(const float* logits, int vocab, const SamplingParams& sp,
   return idx.back();
 }
 
-}  // namespace ninfer
-
 Engine::Engine(const std::string& model_dir, const ModelOptions& options,
                bool enable_thinking)
     : renderer_(enable_thinking), opt_(options) {
