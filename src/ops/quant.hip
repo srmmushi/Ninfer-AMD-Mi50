@@ -189,62 +189,75 @@ __global__ void gemv_q4_fused_kernel(__half* __restrict__ y16,
   }
 }
 
+// Unpacks 8 FP16 values held in one uint4 into floats (register-only).
+__device__ inline void q4_unpack8(const uint4& v, float out[8]) {
+  uint32_t words[4] = {v.x, v.y, v.z, v.w};
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    out[2 * i] = __half2float(
+        __ushort_as_half(static_cast<uint16_t>(words[i] & 0xFFFFu)));
+    out[2 * i + 1] =
+        __half2float(__ushort_as_half(static_cast<uint16_t>(words[i] >> 16)));
+  }
+}
+
 // ---------------------------------------------------------------------------
-// Q4 GEMM (prefill): one block per (output column n, M-tile). The weight row
-// is dequantized into LDS in chunks; threads sweep k and accumulate MT rows.
-// Weights are read once (INT4), activations coalesced — no FP16
-// materialization of the weight matrix.
+// Q4 GEMM (prefill): one block per (output column n, M-tile of MT rows).
+//
+// Each thread processes ONE quantization group per iteration:
+//   * 32 weights == one packed uint4 (16 B) == exactly one group, so the group
+//     scale is a single value;
+//   * the matching 32 activations are 4 x uint4 (64 B) — fully vectorized,
+//     contiguous per thread and coalesced across the wave.
+//
+// No LDS, no __syncthreads() in the main loop: a packed weight row is only
+// cols/2 bytes (2 KB at cols=4096) and stays resident in L1 while the MT rows
+// sweep it, so staging it in shared memory only added a 32x LDS read
+// amplification (every row re-read the whole tile) plus barriers.
 // ---------------------------------------------------------------------------
 template <int MT>
-__global__ void gemm_q4_kernel(__half* out, const __half* x,
-                               const uint8_t* packed, const __half* scales,
-                               int M, int N, int cols, int groups_per_row) {
-  __shared__ __half w_s[kQ4Tile];
+__global__ void gemm_q4_kernel(__half* __restrict__ out,
+                               const __half* __restrict__ x,
+                               const uint8_t* __restrict__ packed,
+                               const __half* __restrict__ scales, int M, int N,
+                               int cols, int groups_per_row) {
   __shared__ float part[MT][kQuantBlock / 64];  // per-warp partials
   __shared__ float acc_s[MT];
   int n = blockIdx.x;
   int m0 = blockIdx.y * MT;
-  const uint4* qrow = reinterpret_cast<const uint4*>(
-      packed + static_cast<int64_t>(n) * (cols / 2));
-  const __half* srow = scales + static_cast<int64_t>(n) * groups_per_row;
+  const uint4* __restrict__ qrow = q4_row(packed, n, groups_per_row);
+  const __half* __restrict__ srow = scales + static_cast<int64_t>(n) * groups_per_row;
   float acc[MT];
   for (int i = 0; i < MT; ++i) acc[i] = 0.0f;
 
-  for (int k0 = 0; k0 < cols; k0 += kQ4Tile) {
-    int chunk = kQ4Tile < (cols - k0) ? kQ4Tile : (cols - k0);
-    // Dequantize this chunk into LDS: each thread handles one group.
-    int g = k0 / kQ4Group + threadIdx.x;
-    int local = g - k0 / kQ4Group;
-    if (local * kQ4Group < chunk && g < groups_per_row) {
-      uint4 p = qrow[g];
-      float sc = __half2float(srow[g]);
-      uint32_t words[4] = {p.x, p.y, p.z, p.w};
-      int base = local * kQ4Group;
+  for (int i = 0; i < MT; ++i) {
+    int m = m0 + i;
+    if (m >= M) break;  // uniform per block; no barrier inside the loop
+    const uint4* __restrict__ arow =
+        reinterpret_cast<const uint4*>(x + static_cast<int64_t>(m) * cols);
+    for (int g = threadIdx.x; g < groups_per_row; g += blockDim.x) {
+      uint4 p = qrow[g];                 // 32 nibbles
+      float sc = __half2float(srow[g]);  // one group -> one scale
+      uint32_t nib[4] = {p.x, p.y, p.z, p.w};
+      float a = 0.0f;
+#pragma unroll
       for (int w = 0; w < 4; ++w) {
+        uint4 av = arow[static_cast<int64_t>(g) * 4 + w];  // 8 activations
+        float af[8];
+        q4_unpack8(av, af);
+        uint32_t word = nib[w];
+#pragma unroll
         for (int j = 0; j < 8; ++j) {
-          int nib = static_cast<int>((words[w] >> (4 * j)) & 0xFu);
-          w_s[base + w * 8 + j] =
-              __float2half((static_cast<float>(nib) - 8.0f) * sc);
+          int q = static_cast<int>((word >> (4 * j)) & 0xFu);
+          a += (static_cast<float>(q) - 8.0f) * sc * af[j];
         }
       }
+      acc[i] += a;
     }
-    __syncthreads();
-    for (int k = threadIdx.x; k < chunk; k += blockDim.x) {
-      float wv = __half2float(w_s[k]);
-      int64_t off = static_cast<int64_t>(k0) + k;
-      for (int i = 0; i < MT; ++i) {
-        int m = m0 + i;
-        if (m < M) {
-          acc[i] += __half2float(x[static_cast<int64_t>(m) * cols + off]) * wv;
-        }
-      }
-    }
-    __syncthreads();
   }
 
-  // Reduce each of the MT accumulators across the block: warp shuffle first,
-  // then one barrier, then a single-threaded cross-warp sum (uniform control
-  // flow — no barrier inside a conditional).
+  // Reduce the MT accumulators across the block: warp shuffle, one barrier,
+  // single-threaded cross-warp sum (uniform control flow).
   for (int i = 0; i < MT; ++i) {
     float v = q4_warp_reduce(acc[i]);
     if (threadIdx.x % 64 == 0) {
