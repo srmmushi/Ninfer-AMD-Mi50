@@ -102,6 +102,61 @@ single-GPU golden run:
   --prompt "..." --max-new 256
 ```
 
+## vLLM integration (vLLM + NInfer-HIP running side by side)
+
+Following the [gfx906-vllm](https://github.com/ttdxq/gfx906-vllm) approach, the
+gfx906-supported vLLM branch and NInfer-HIP run **at the same time**, each on
+its own GPU, behind one gateway port:
+
+```
+client -> :9000 gateway -> :8000 vLLM    (GPU0: continuous batching, PagedAttention)
+                        -> :8080 ninfer  (GPU1: low-latency HIP engine)
+```
+
+```bash
+# one GPU each, unified entry point on :9000
+MODEL=/data/models/Qwen3-14B VLLM_DIR=$HOME/gfx906-vllm ./tools/run_dual.sh
+
+# route by model prefix
+curl http://127.0.0.1:9000/v1/chat/completions -H 'Content-Type: application/json' \
+  -d '{"model":"ninfer/Qwen3-14B","messages":[{"role":"user","content":"hi"}]}'
+curl http://127.0.0.1:9000/v1/chat/completions -H 'Content-Type: application/json' \
+  -d '{"model":"vllm/Qwen3-14B","messages":[{"role":"user","content":"hi"}]}'
+```
+
+### C API (`libninfer.so`)
+
+`src/api/ninfer_c_api.h` exposes an `extern "C"` surface (model load,
+tokenizer, per-sequence prefill/decode, **batched decode step**, KV-cache
+introspection, sampling) so any scheduler — including a vLLM worker — can drive
+the HIP engine without touching C++:
+
+```c
+ninfer_options_t opt = {4096, 512, 4, 1, gpus};   // ctx, chunk, seq slots, gpus
+ninfer_engine_t* eng; ninfer_load(dir, &opt, &eng);
+ninfer_session_t* s = ninfer_session_create(eng);
+float* logits = malloc(vocab * sizeof(float));
+ninfer_prefill(s, ids, n, logits, vocab);
+long long tok = ninfer_sample(eng, logits, 0.7f, 50, 0.95f, 1.0f, seed);
+ninfer_decode(s, tok, logits, vocab);
+// continuous batching: one GPU step for N requests
+ninfer_decode_batch(eng, sessions, tokens, n, all_logits, n * vocab);
+```
+
+```bash
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_HIP_ARCHITECTURES=gfx906 -DNINFER_BUILD_SHARED=ON
+cmake --build build -j$(nproc)          # -> build/libninfer.so
+
+export NINFER_LIB=$PWD/build/libninfer.so
+PYTHONPATH=tools python3 tools/demo_ninfer_capi.py \
+  --model /data/models/Qwen3-14B --gpus 1 --sequences 4 --max-new 64
+```
+
+`ninfer_decode_batch` maps N in-flight requests onto the reserved KV slabs and
+executes them in a single forward pass — the continuous-batching primitive a
+PagedAttention scheduler needs.
+
 ## Architecture
 
 ```

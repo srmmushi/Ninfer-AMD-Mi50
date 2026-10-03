@@ -21,7 +21,6 @@ struct Model::Impl {
 
   int H, D, Hq, Hkv, V, I, layers;
   float eps, theta, attn_scale;
-  int wqkv;
 
   // -------------------------------------------------------------------------
   // A Shard owns a contiguous layer range on ONE device (pipeline/layer
@@ -39,7 +38,7 @@ struct Model::Impl {
     struct Layer {
       DeviceBuffer ln1, ln2;
       DeviceBuffer wqkv_fused;  // [Hq*D + 2*Hkv*D, H] — Q/K/V concatenated at
-                                // load time so prefill issues ONE GEMM
+                                // load time so one GEMM/GEMV covers all three
       DeviceBuffer qn, kn;      // Qwen3 per-head q/k norms
       DeviceBuffer gu, down;    // dense FFN: gu = [gate; up] fused [2I, H]
       DeviceBuffer moe_gate, moe_gu, moe_down;  // MoE: gu per expert [E, 2I, H]
@@ -48,9 +47,9 @@ struct Model::Impl {
 
     DeviceBuffer embed, final_norm, lm_head;
 
-    // Activation workspace (sized for prefill_chunk tokens).
+    // Activation workspace (sized for max(prefill_chunk, num_sequences) rows).
     DeviceBuffer hidden, normed, qkv, attn_out, proj, gate_up, act, logits_buf;
-    DeviceBuffer ids_dev;
+    DeviceBuffer ids_dev, pos_dev, seq_dev;
     // MoE workspace.
     DeviceBuffer moe_logits, moe_perm, moe_eout, moe_gate_up, moe_act;
     DeviceBuffer moe_order_dev, moe_w_dev;
@@ -59,9 +58,6 @@ struct Model::Impl {
 
     size_t weight_bytes = 0;
 
-    // ------------------------------------------------------------------
-    // Weight loading: safetensors (single or sharded) -> FP16 device.
-    // ------------------------------------------------------------------
     struct WeightSource {
       std::vector<std::unique_ptr<SafeTensorsFile>> files;
       std::map<std::string, SafeTensorsFile*> by_name;
@@ -116,7 +112,7 @@ struct Model::Impl {
 
     void load(const std::string& dir, const ModelConfig& c, int dim_H, int dim_D,
               int dim_Hq, int dim_Hkv, int dim_V, int dim_I, float dim_eps,
-              float rope_theta, int chunk, int max_ctx) {
+              float rope_theta, int chunk, int max_ctx, int num_seq) {
       DeviceGuard guard(device);
       cfg_local = c;
       H = dim_H; D = dim_D; Hq = dim_Hq; Hkv = dim_Hkv; V = dim_V; I = dim_I;
@@ -126,10 +122,14 @@ struct Model::Impl {
                layer_end, owns_embed ? " +embed" : "", owns_head ? " +head" : "");
       WeightSource ws = open_weights(dir);
 
+      int rows_max = std::max(chunk, num_seq);
+
       if (owns_embed) {
         embed = load_fp16(ws, "model.embed_tokens.weight");
-        ids_dev.alloc(static_cast<size_t>(chunk) * sizeof(int64_t));
+        ids_dev.alloc(static_cast<size_t>(rows_max) * sizeof(int64_t));
       }
+      pos_dev.alloc(static_cast<size_t>(rows_max) * sizeof(int));
+      seq_dev.alloc(static_cast<size_t>(rows_max) * sizeof(int));
       if (owns_head) {
         final_norm = load_fp16(ws, "model.norm.weight");
         // Tied embeddings: the last shard may not own the embedding table,
@@ -137,7 +137,8 @@ struct Model::Impl {
         lm_head = cfg_local.tie_word_embeddings
                       ? load_fp16(ws, "model.embed_tokens.weight")
                       : load_fp16(ws, "lm_head.weight");
-        logits_buf.alloc(static_cast<size_t>(V) * 4);
+        // One logits row per concurrent sequence.
+        logits_buf.alloc(static_cast<size_t>(num_seq) * V * 4);
       }
 
       lw.resize(layer_end - layer_begin);
@@ -173,10 +174,11 @@ struct Model::Impl {
         }
         if (cfg_local.is_moe) {
           L.moe_gate = load_fp16(ws, p + "mlp.gate.weight");
-          // Per-expert gate/up fusion: [E, I, H] + [E, I, H] -> [E, 2I, H] so
-          // both prefill and decode issue ONE projection per expert.
-          DeviceBuffer tg = load_fp16(ws, p + "mlp.experts.gate_proj.weight", false);
-          DeviceBuffer tu = load_fp16(ws, p + "mlp.experts.up_proj.weight", false);
+          // Per-expert gate/up fusion: [E, I, H] + [E, I, H] -> [E, 2I, H].
+          DeviceBuffer tg =
+              load_fp16(ws, p + "mlp.experts.gate_proj.weight", false);
+          DeviceBuffer tu =
+              load_fp16(ws, p + "mlp.experts.up_proj.weight", false);
           int E = cfg_local.num_experts;
           size_t seg = static_cast<size_t>(I) * H * 2;
           L.moe_gu.alloc(static_cast<size_t>(E) * 2 * I * H * 2);
@@ -210,13 +212,13 @@ struct Model::Impl {
       }
 
       // Activation workspace.
-      hidden.alloc(static_cast<size_t>(chunk) * H * 2);
-      normed.alloc(static_cast<size_t>(chunk) * H * 2);
-      qkv.alloc(static_cast<size_t>(chunk) * (Hq + 2 * Hkv) * D * 2);
-      attn_out.alloc(static_cast<size_t>(chunk) * Hq * D * 2);
-      proj.alloc(static_cast<size_t>(chunk) * H * 2);
-      gate_up.alloc(static_cast<size_t>(chunk) * 2 * I * 2);
-      act.alloc(static_cast<size_t>(chunk) * I * 2);
+      hidden.alloc(static_cast<size_t>(rows_max) * H * 2);
+      normed.alloc(static_cast<size_t>(rows_max) * H * 2);
+      qkv.alloc(static_cast<size_t>(rows_max) * (Hq + 2 * Hkv) * D * 2);
+      attn_out.alloc(static_cast<size_t>(rows_max) * Hq * D * 2);
+      proj.alloc(static_cast<size_t>(rows_max) * H * 2);
+      gate_up.alloc(static_cast<size_t>(rows_max) * 2 * I * 2);
+      act.alloc(static_cast<size_t>(rows_max) * I * 2);
       // RoPE frequency table: inv_freq[i] = theta^(-2i/D), computed once.
       {
         std::vector<float> freqs(D / 2);
@@ -227,8 +229,9 @@ struct Model::Impl {
         rope_freq.copy_from_host(freqs.data(), rope_freq.bytes());
       }
       if (cfg_local.is_moe) {
-        size_t tsel = static_cast<size_t>(chunk) * cfg_local.num_experts_per_tok;
-        moe_logits.alloc(static_cast<size_t>(chunk) * cfg_local.num_experts * 4);
+        size_t tsel = static_cast<size_t>(rows_max) *
+                      cfg_local.num_experts_per_tok;
+        moe_logits.alloc(static_cast<size_t>(rows_max) * cfg_local.num_experts * 4);
         moe_perm.alloc(tsel * H * 2);
         moe_eout.alloc(tsel * H * 2);
         moe_gate_up.alloc(tsel * 2 * I * 2);
@@ -236,24 +239,30 @@ struct Model::Impl {
         moe_order_dev.alloc(tsel * sizeof(int64_t));
         moe_w_dev.alloc(tsel * sizeof(float));
       }
-      kv = std::make_unique<KVCache>(layer_end - layer_begin, max_ctx, Hkv, D);
+      kv = std::make_unique<KVCache>(layer_end - layer_begin, max_ctx, Hkv, D,
+                                     num_seq);
       blas = std::make_unique<Blas>();
       HIP_CHECK(hipDeviceSynchronize());
     }
 
-    // Config mirror (avoid caching full cfg per shard otherwise).
     ModelConfig cfg_local;
     int H = 0, D = 0, Hq = 0, Hkv = 0, V = 0, I = 0;
     float eps = 1e-6f;
 
-    // Runs this shard's layer range. `tokens` is only read when owns_embed.
-    // Returns device logits if owns_head, else nullptr. Current device must
-    // be `device` (handled by caller via DeviceGuard).
-    const float* forward(const std::vector<int64_t>& tokens, int pos0) {
+    // Runs this shard's layer range over `rows` activation rows. Each row
+    // belongs to sequence `seq_ids[r]` at absolute position `positions[r]`;
+    // rows of one sequence form a group that shares its KV slab.
+    ForwardOutput forward_batch(const std::vector<int64_t>& tokens,
+                                const std::vector<int>& positions,
+                                const std::vector<int>& seq_ids) {
       hipStream_t stream = 0;
       int T = static_cast<int>(tokens.size());
-      int chunk = static_cast<int>(hidden.bytes() / (H * 2));
-      if (T > chunk) throw std::runtime_error("prefill chunk exceeds workspace");
+      int rows_max = static_cast<int>(hidden.bytes() / (H * 2));
+      if (T > rows_max) throw std::runtime_error("batch exceeds workspace rows");
+      if (T != static_cast<int>(positions.size()) ||
+          T != static_cast<int>(seq_ids.size())) {
+        throw std::runtime_error("forward_batch: mismatched row descriptors");
+      }
 
       if (owns_embed) {
         HIP_CHECK(hipMemcpyAsync(ids_dev.data(), tokens.data(),
@@ -263,62 +272,95 @@ struct Model::Impl {
                           static_cast<const int64_t*>(ids_dev.data()), T, H,
                           stream);
       }
+      HIP_CHECK(hipMemcpyAsync(pos_dev.data(), positions.data(),
+                               T * sizeof(int), hipMemcpyHostToDevice, stream));
+      HIP_CHECK(hipMemcpyAsync(seq_dev.data(), seq_ids.data(),
+                               T * sizeof(int), hipMemcpyHostToDevice, stream));
 
-      int nlayers_total = cfg_local.num_hidden_layers;
+      // Group contiguous rows by sequence (one group == one request).
+      struct Group { int seq, start, count, pos0; };
+      std::vector<Group> groups;
+      for (int i = 0; i < T;) {
+        int j = i;
+        while (j < T && seq_ids[j] == seq_ids[i]) ++j;
+        groups.push_back({seq_ids[i], i, j - i, positions[i]});
+        i = j;
+      }
+      bool all_single = true;
+      for (const Group& g : groups) {
+        if (g.count != 1) all_single = false;
+      }
+
+      const int wqkv = Hq * D + 2 * Hkv * D;
+      const float attn_scale_ = 1.0f / std::sqrt(static_cast<float>(D));
+
       for (int li = 0; li < static_cast<int>(lw.size()); ++li) {
         const Layer& L = lw[li];
-        int l = layer_begin + li;
-        bool model_last = (l == nlayers_total - 1);
 
         rmsnorm_fp16(normed.data(), hidden.data(), L.ln1.data(), T, H, eps,
                      stream);
 
-        const float attn_scale = 1.0f / std::sqrt(static_cast<float>(D));
+        // ---- QKV projection.
         if (T == 1) {
-          // ---- Decode fast path (M = 1): custom GEMV + fused post-QKV.
-          // qkv GEMV, then ONE kernel for (optional qk-norm) + rope + KV
-          // append; attention over the cache.
-          gemv_fp16(qkv.data(), L.wqkv_fused.data(), normed.data(),
-                    Hq * D + 2 * Hkv * D, H, stream);
+          gemv_fp16(qkv.data(), L.wqkv_fused.data(), normed.data(), wqkv, H,
+                    stream);
+          // Fused qk-norm + rope + KV append for the single row.
           decode_post_qkv_fp16(
-              qkv.data(), kv->k_data(li), kv->v_data(li), rope_freq.data(),
-              pos0, Hq, Hkv, D, cfg_local.use_qk_norm,
+              qkv.data(), kv->k_data(li, groups[0].seq),
+              kv->v_data(li, groups[0].seq), rope_freq.data(), groups[0].pos0,
+              Hq, Hkv, D, cfg_local.use_qk_norm,
               cfg_local.use_qk_norm ? L.qn.data() : nullptr,
               cfg_local.use_qk_norm ? L.kn.data() : nullptr, eps, stream);
-          attention_decode_fp16(attn_out.data(),
-                                static_cast<const __half*>(qkv.data()),
-                                kv->k_data(li), kv->v_data(li), pos0 + 1, Hq,
-                                Hkv, D, attn_scale, stream);
         } else {
-          // ---- Prefill path: fused QKV GEMM + per-token kernels.
           blas->gemm_view(normed.data(), H, false, L.wqkv_fused.data(), H, true,
-                          qkv.data(), Hq * D + 2 * Hkv * D,
-                          Hq * D + 2 * Hkv * D, T, H, false, stream);
-          __half* qsec_p = static_cast<__half*>(qkv.data());
-          __half* ksec_p = qsec_p + Hq * D;
-          if (cfg_local.use_qk_norm) {
-            rmsnorm_heads_fp16(qsec_p, qsec_p, L.qn.data(), T, Hq, D,
-                               Hq * D + 2 * Hkv * D, eps, stream);
-            rmsnorm_heads_fp16(ksec_p, ksec_p, L.kn.data(), T, Hkv, D,
-                               Hq * D + 2 * Hkv * D, eps, stream);
+                          qkv.data(), wqkv, wqkv, T, H, false, stream);
+          if (all_single) {
+            // Batched decode: one fused kernel for qk-norm + rope + append.
+            decode_post_qkv_batch_fp16(
+                qkv.data(), kv->k_base(li), kv->v_base(li), pos_dev.data(),
+                seq_dev.data(), T, Hq, Hkv, D, wqkv, kv->seq_stride_elems(),
+                rope_freq.data(), cfg_local.use_qk_norm,
+                cfg_local.use_qk_norm ? L.qn.data() : nullptr,
+                cfg_local.use_qk_norm ? L.kn.data() : nullptr, eps, stream);
+          } else {
+            __half* qs = static_cast<__half*>(qkv.data());
+            __half* ks = qs + Hq * D;
+            if (cfg_local.use_qk_norm) {
+              rmsnorm_heads_fp16(qs, qs, L.qn.data(), T, Hq, D, wqkv, eps,
+                                 stream);
+              rmsnorm_heads_fp16(ks, ks, L.kn.data(), T, Hkv, D, wqkv, eps,
+                                 stream);
+            }
+            rope_fp16(qs, T, Hq, D, wqkv, pos_dev.data(), rope_freq.data(),
+                      stream);
+            rope_fp16(ks, T, Hkv, D, wqkv, pos_dev.data(), rope_freq.data(),
+                      stream);
+            for (const Group& g : groups) {
+              kv->append(li, g.seq, g.pos0, qs, qs, g.start, Hq * D,
+                         (Hq + Hkv) * D, wqkv, g.count, stream);
+            }
           }
-          rope_fp16(qsec_p, T, Hq, D, Hq * D + 2 * Hkv * D, pos0,
-                    rope_freq.data(), stream);
-          rope_fp16(ksec_p, T, Hkv, D, Hq * D + 2 * Hkv * D, pos0,
-                    rope_freq.data(), stream);
-          kv->append(li, pos0, qsec_p, qsec_p, Hq * D, (Hq + Hkv) * D,
-                     Hq * D + 2 * Hkv * D, T, stream);
-          // All heads in one fused flash kernel (LDS double-buffered K/V
-          // tiles, online softmax, no score scratch).
-          attention_prefill_fused_fp16(
-              attn_out.data(), qsec_p, kv->k_data(li), kv->v_data(li), T,
-              pos0 + T, pos0, Hq, Hkv, D, Hq * D + 2 * Hkv * D, Hq * D,
-              attn_scale, stream);
         }
 
-        // o_proj + fused (residual add -> post-attention RMSNorm): the FFN
-        // input is produced in the same pass that updates the residual
-        // stream, saving one full [T, H] read+write per layer.
+        // ---- Attention (per group: each group owns its KV slab).
+        for (const Group& g : groups) {
+          __half* q_row = static_cast<__half*>(qkv.data()) +
+                          static_cast<int64_t>(g.start) * wqkv;
+          __half* out_row = static_cast<__half*>(attn_out.data()) +
+                            static_cast<int64_t>(g.start) * Hq * D;
+          if (g.count == 1) {
+            attention_decode_fp16(out_row, q_row, kv->k_data(li, g.seq),
+                                  kv->v_data(li, g.seq), g.pos0 + 1, Hq, Hkv, D,
+                                  attn_scale_, stream);
+          } else {
+            attention_prefill_fused_fp16(
+                out_row, q_row, kv->k_data(li, g.seq), kv->v_data(li, g.seq),
+                g.count, g.pos0 + g.count, g.pos0, Hq, Hkv, D, wqkv, Hq * D,
+                attn_scale_, stream);
+          }
+        }
+
+        // ---- o_proj + fused (residual add -> post-attention RMSNorm).
         if (T == 1) {
           gemv_fp16(proj.data(), L.wo.data(), attn_out.data(), H, Hq * D,
                     stream);
@@ -329,9 +371,9 @@ struct Model::Impl {
         fused_residual_rmsnorm_fp16(hidden.data(), proj.data(), normed.data(),
                                     L.ln2.data(), T, H, eps, stream);
 
+        // ---- FFN.
         if (!cfg_local.is_moe) {
           if (T == 1) {
-            // Fused gate/up weight: one GEMV, then SwiGLU, then down GEMV.
             gemv_fp16(gate_up.data(), L.gu.data(), normed.data(), 2 * I, H,
                       stream);
             silu_and_mul_fp16(act.data(), gate_up.data(), 1, I, stream);
@@ -354,8 +396,8 @@ struct Model::Impl {
                                moe_logits.data(), T, E, H, stream);
           }
           MoERoutingPlan plan = moe_route_cpu(
-              static_cast<const float*>(moe_logits.data()), T, E, topk,
-              *blas, stream);
+              static_cast<const float*>(moe_logits.data()), T, E, topk, *blas,
+              stream);
           size_t tsel = plan.order.size();
           HIP_CHECK(hipMemcpyAsync(moe_order_dev.data(), plan.order.data(),
                                    tsel * sizeof(int64_t),
@@ -404,34 +446,34 @@ struct Model::Impl {
               static_cast<int>(tsel), H, stream);
         }
 
-        if (model_last && owns_head) {
-          // FFN residual, then final norm + LM head for the last row only.
-          residual_add_fp16(hidden.data(), proj.data(), T, H, stream);
-          __half* h_last = static_cast<__half*>(hidden.data()) + (T - 1) * H;
-          __half* n_last = static_cast<__half*>(normed.data()) + (T - 1) * H;
-          rmsnorm_fp16(n_last, h_last, final_norm.data(), 1, H, eps, stream);
-          if (T == 1) {
-            gemv_fp32out(logits_buf.data(), lm_head.data(), n_last, V, H,
-                         stream);
-          } else {
-            blas->gemm_fp32out(n_last, lm_head.data(), logits_buf.data(), 1, V,
-                               H, stream);
-          }
-          return static_cast<const float*>(logits_buf.data());
-        }
         residual_add_fp16(hidden.data(), proj.data(), T, H, stream);
       }
 
+      // ---- Logits: last row of each sequence group, only on the head shard.
+      ForwardOutput out;
+      out.rows = static_cast<int>(groups.size());
+      for (const Group& g : groups) out.group_seq.push_back(g.seq);
       if (owns_head) {
-        // Degenerate shard with zero layers but head ownership (single-layer
-        // split edge case): norm the incoming hidden directly.
-        rmsnorm_fp16(normed.data(), hidden.data(), final_norm.data(), 1, H, eps,
-                     stream);
-        blas->gemm_fp32out(normed.data(), lm_head.data(), logits_buf.data(), 1,
-                           V, H, stream);
-        return static_cast<const float*>(logits_buf.data());
+        out.logits = static_cast<const float*>(logits_buf.data());
+        for (int gi = 0; gi < out.rows; ++gi) {
+          const Group& g = groups[gi];
+          int r = g.start + g.count - 1;
+          __half* h_last = static_cast<__half*>(hidden.data()) +
+                           static_cast<int64_t>(r) * H;
+          __half* n_row = static_cast<__half*>(normed.data()) +
+                          static_cast<int64_t>(gi) * H;
+          rmsnorm_fp16(n_row, h_last, final_norm.data(), 1, H, eps, stream);
+          float* logits_row = static_cast<float*>(logits_buf.data()) +
+                              static_cast<int64_t>(gi) * V;
+          if (T == 1) {
+            gemv_fp32out(logits_row, lm_head.data(), n_row, V, H, stream);
+          } else {
+            blas->gemm_view(n_row, H, false, lm_head.data(), H, true,
+                            logits_row, V, V, 1, H, /*c_fp32=*/true, stream);
+          }
+        }
       }
-      return nullptr;
+      return out;
     }
   };
 
@@ -441,7 +483,6 @@ struct Model::Impl {
     for (hipEvent_t e : boundary_events) (void)hipEventDestroy(e);
   }
 
-  // -------------------------------------------------------------------------
   void load(const std::string& dir) {
     cfg = ModelConfig::from_file(path_join(dir, "config.json"));
     H = cfg.hidden_size;
@@ -462,7 +503,6 @@ struct Model::Impl {
                                "num_key_value_heads");
     }
 
-    // Build the shard layout: contiguous layer ranges, one per device.
     std::vector<int> gpus;
     {
       std::set<int> uniq;
@@ -474,13 +514,11 @@ struct Model::Impl {
     int n = static_cast<int>(gpus.size());
     if (n > 1 && layers < n) {
       throw std::runtime_error("cannot split " + std::to_string(layers) +
-                               " layers across " + std::to_string(n) +
-                               " GPUs");
+                               " layers across " + std::to_string(n) + " GPUs");
     }
-    LOG_INFO("loading weights from %s (%d GPU%s)...", dir.c_str(), n,
-             n > 1 ? "s" : "");
+    LOG_INFO("loading weights from %s (%d GPU%s, %d sequence slots)...",
+             dir.c_str(), n, n > 1 ? "s" : "", opt.num_sequences);
 
-    // Every requested device must be gfx906 (init_device only checks dev0).
     for (int g : gpus) {
       hipDeviceProp_t prop{};
       HIP_CHECK(hipGetDeviceProperties(&prop, g));
@@ -498,14 +536,13 @@ struct Model::Impl {
       sh->layer_end = layers * (s + 1) / n;
       sh->owns_embed = (s == 0);
       sh->owns_head = (s == n - 1);
-      // Guard during load so hipMalloc/hipMemcpy land on the right device.
       sh->load(dir, cfg, H, D, Hq, Hkv, V, I, eps, theta, opt.prefill_chunk,
-               opt.max_context);
+               opt.max_context, opt.num_sequences);
       shards.push_back(std::move(sh));
     }
 
-    // Enable PCIe peer access where the platform allows it; hipMemcpyPeerAsync
-    // transparently falls back to host staging otherwise.
+    // PCIe peer access where the platform allows it; hipMemcpyPeerAsync
+    // falls back to host staging otherwise.
     for (int i = 0; i < n; ++i) {
       for (int j = 0; j < n; ++j) {
         if (i == j) continue;
@@ -514,7 +551,7 @@ struct Model::Impl {
         if (e != hipSuccess && e != hipErrorPeerAccessAlreadyEnabled) {
           LOG_WARN("P2P dev%d->dev%d unavailable (%s); using staged copies",
                    gpus[i], gpus[j], hipGetErrorString(e));
-          (void)hipGetLastError();  // clear the error state
+          (void)hipGetLastError();
         }
       }
     }
@@ -529,20 +566,20 @@ struct Model::Impl {
     // after its last kernel, awaited on the consumer's stream before the
     // cross-device copy — no host-side device drains.
     for (int i = 0; i + 1 < n; ++i) {
-      HIP_CHECK(hipEventCreate(&boundary_events.emplace_back()));
+      hipEvent_t ev;
+      HIP_CHECK(hipEventCreate(&ev));
+      boundary_events.push_back(ev);
     }
   }
 
-  // Cross-shard activation transfer, ordered entirely by GPU events:
-  //   producer stream --(event)--> consumer stream wait --> peer copy.
-  // This removes the two hipDeviceSynchronize() drains per forward that the
-  // naive pipeline needed, which dominated dual-GPU decode latency.
   std::vector<hipEvent_t> boundary_events;
 
-  const float* forward(const std::vector<int64_t>& tokens, int pos0,
-                       hipStream_t /*stream*/) {
+  ForwardOutput forward_batch(const std::vector<int64_t>& tokens,
+                              const std::vector<int>& positions,
+                              const std::vector<int>& seq_ids,
+                              hipStream_t /*stream*/) {
     int T = static_cast<int>(tokens.size());
-    const float* logits = nullptr;
+    ForwardOutput out;
     for (size_t s = 0; s < shards.size(); ++s) {
       Shard& cur = *shards[s];
       if (s > 0) {
@@ -554,12 +591,12 @@ struct Model::Impl {
                                      static_cast<size_t>(T) * H * 2, 0));
       }
       DeviceGuard g(cur.device);
-      logits = cur.forward(tokens, pos0);
+      out = cur.forward_batch(tokens, positions, seq_ids);
       if (s + 1 < shards.size()) {
         HIP_CHECK(hipEventRecord(boundary_events[s], 0));
       }
     }
-    return logits;
+    return out;
   }
 };
 
@@ -575,22 +612,47 @@ Model::~Model() = default;
 
 const ModelConfig& Model::config() const { return impl_->cfg; }
 int Model::device_count() const { return static_cast<int>(impl_->shards.size()); }
+int Model::num_sequences() const { return impl_->opt.num_sequences; }
 int Model::output_device() const { return impl_->shards.back()->device; }
+
 void Model::reset_cache() {
   for (auto& s : impl_->shards) {
     DeviceGuard g(s->device);
     s->kv->reset();
   }
 }
+
+void Model::reset_cache(int seq) {
+  for (auto& s : impl_->shards) {
+    DeviceGuard g(s->device);
+    for (int l = 0; l < s->kv->layers(); ++l) {
+      // Slot reuse: only the logical length is tracked per sequence.
+      s->kv->set_length(seq, 0);
+    }
+  }
+}
+
 size_t Model::weight_bytes() const {
   size_t total = 0;
   for (auto& s : impl_->shards) total += s->weight_bytes;
   return total;
 }
 
+ForwardOutput Model::forward_batch(const std::vector<int64_t>& tokens,
+                                   const std::vector<int>& positions,
+                                   const std::vector<int>& seq_ids,
+                                   hipStream_t stream) {
+  return impl_->forward_batch(tokens, positions, seq_ids, stream);
+}
+
 const float* Model::forward(const std::vector<int64_t>& tokens, int pos0,
                             hipStream_t stream) {
-  return impl_->forward(tokens, pos0, stream);
+  std::vector<int> positions(tokens.size()), seq_ids(tokens.size(), 0);
+  for (size_t i = 0; i < tokens.size(); ++i) {
+    positions[i] = pos0 + static_cast<int>(i);
+  }
+  ForwardOutput out = impl_->forward_batch(tokens, positions, seq_ids, stream);
+  return out.logits;
 }
 
 }  // namespace ninfer

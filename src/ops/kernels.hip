@@ -71,15 +71,15 @@ __global__ void rmsnorm_heads_kernel(__half* out, const __half* x,
 }
 
 __global__ void rope_kernel(__half* x, int tokens, int head_dim, int heads,
-                            int row_stride, int pos_offset,
+                            int row_stride, const int* row_pos,
                             const float* inv_freq) {
   // x: rows of [heads, head_dim] with `row_stride` elements between tokens;
-  // one block per token. Frequencies come from a precomputed device table,
-  // removing the per-element powf() of the naive version.
+  // one block per token. Each row carries its own absolute position, which
+  // makes the kernel usable for batched multi-sequence decode.
   int t = blockIdx.x;
   int half = head_dim / 2;
   int64_t base = static_cast<int64_t>(t) * row_stride;
-  float pos = static_cast<float>(pos_offset + t);
+  float pos = static_cast<float>(row_pos[t]);
   for (int h = 0; h < heads; ++h) {
     __half* xr = x + base + static_cast<int64_t>(h) * head_dim;
     for (int i = threadIdx.x; i < half; i += blockDim.x) {
@@ -241,12 +241,12 @@ void rmsnorm_heads_fp16(void* out, const void* x, const void* weight, int rows,
 }
 
 void rope_fp16(void* x, int tokens, int heads, int head_dim, int row_stride,
-               int pos_offset, const void* inv_freq, hipStream_t stream) {
+               const void* row_pos, const void* inv_freq, hipStream_t stream) {
   int half = head_dim / 2;
   int block = half < kBlock ? (half + 63) / 64 * 64 : kBlock;
   hipLaunchKernelGGL(rope_kernel, dim3(tokens), dim3(block), 0, stream,
                      static_cast<__half*>(x), tokens, head_dim, heads,
-                     row_stride, pos_offset,
+                     row_stride, static_cast<const int*>(row_pos),
                      static_cast<const float*>(inv_freq));
 }
 

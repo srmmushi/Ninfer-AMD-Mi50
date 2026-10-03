@@ -55,10 +55,13 @@ void rmsnorm_heads_fp16(void* out, const void* x, const void* weight, int rows,
                         hipStream_t stream = 0);
 
 // RoPE (half-split rotate_half style) on [T, H, D] with explicit token
-// stride; positions start at `pos_offset`. `inv_freq` is a device table of
-// head_dim/2 FP32 frequencies (precomputed once — avoids per-element powf).
+// stride. `row_pos` is a device int array holding the absolute position of
+// each row (batched decode rows belong to different sequences, so a single
+// pos_offset is not enough). `inv_freq` is a device table of head_dim/2 FP32
+// frequencies (precomputed once — avoids per-element powf).
 void rope_fp16(void* x, int tokens, int heads, int head_dim, int row_stride,
-               int pos_offset, const void* inv_freq, hipStream_t stream = 0);
+               const void* row_pos, const void* inv_freq,
+               hipStream_t stream = 0);
 
 // Fused residual add + RMSNorm (one pass over the activation instead of two):
 //   hidden = hidden + residual        (written back, keeps the residual chain)
@@ -135,6 +138,17 @@ void decode_post_qkv_fp16(void* qkv, void* k_cache, void* v_cache,
                           int kv_heads, int head_dim, bool has_qknorm,
                           const void* qn_weight, const void* kn_weight,
                           float eps, hipStream_t stream = 0);
+
+// Batched variant for continuous batching: one grid.y row per in-flight
+// sequence, each with its own absolute position and sequence slot. K/V are
+// addressed from the layer's single slab via seq_id * seq_stride_elems.
+void decode_post_qkv_batch_fp16(void* qkv, void* k_base, void* v_base,
+                                const void* row_pos, const void* seq_id,
+                                int rows, int heads, int kv_heads, int head_dim,
+                                int qkv_row_stride, int64_t seq_stride_elems,
+                                const void* inv_freq, bool has_qknorm,
+                                const void* qn_weight, const void* kn_weight,
+                                float eps, hipStream_t stream = 0);
 
 // ---------------------------------------------------------------------------
 // Attention.

@@ -23,6 +23,12 @@ struct SamplingParams {
 
 using TokenCallback = std::function<void(const std::string& delta)>;
 
+// Standalone sampler shared by the engine and the C API / vLLM integration:
+// repetition penalty -> temperature -> top-k -> top-p -> multinomial.
+// `recent` carries the tokens already produced (empty for stateless calls).
+int64_t sample_logits(const float* logits, int vocab, const SamplingParams& sp,
+                      const std::vector<int64_t>& recent, uint64_t seed);
+
 class Engine {
  public:
   Engine(const std::string& model_dir, const ModelOptions& options,

@@ -11,12 +11,13 @@
 #include "core/device.h"
 
 namespace ninfer {
-namespace {
 
 // CPU sampler: repetition penalty -> temperature -> top-k -> top-p ->
 // multinomial. Vocab-sized work per token, negligible vs. the GPU step.
-int64_t sample_token(const float* logits, int vocab, const SamplingParams& sp,
-                     const std::vector<int64_t>& recent, std::mt19937_64& rng) {
+// Public so the C API / vLLM integration can reuse the exact same policy.
+int64_t sample_logits(const float* logits, int vocab, const SamplingParams& sp,
+                      const std::vector<int64_t>& recent, uint64_t seed) {
+  std::mt19937_64 rng(seed);
   std::vector<float> l(logits, logits + vocab);
 
   if (sp.repetition_penalty != 1.0f) {
@@ -80,7 +81,7 @@ int64_t sample_token(const float* logits, int vocab, const SamplingParams& sp,
   return idx.back();
 }
 
-}  // namespace
+}  // namespace ninfer
 
 Engine::Engine(const std::string& model_dir, const ModelOptions& options,
                bool enable_thinking)
@@ -155,8 +156,14 @@ std::string Engine::run(std::vector<int64_t> ids, const SamplingParams& sp,
                                hipMemcpyDeviceToHost, stream));
       HIP_CHECK(hipStreamSynchronize(stream));
     }
-    int64_t next = sample_token(static_cast<const float*>(pinned_logits_), V,
-                                sp, ids, rng);
+    // Seed advances per step so repeated calls stay deterministic when
+    // --seed is given but still vary across tokens.
+    uint64_t step_seed = (sp.seed != 0)
+                             ? static_cast<uint64_t>(sp.seed) + step
+                             : (static_cast<uint64_t>(rng()) ^
+                                (static_cast<uint64_t>(step) << 32));
+    int64_t next = sample_logits(static_cast<const float*>(pinned_logits_), V,
+                                 sp, ids, step_seed);
 
     if (tokenizer_->is_special(next)) break;  // <|im_end|> etc.
     generated.push_back(next);

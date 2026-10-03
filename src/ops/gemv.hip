@@ -57,6 +57,69 @@ __global__ void gemv_kernel(__half* y16, float* y32, const __half* w,
 }
 
 // ---------------------------------------------------------------------------
+// Batched decode post-QKV fusion: grid.y walks the in-flight rows
+// (one row per active sequence), grid.x walks (q | k | v) heads.
+// ---------------------------------------------------------------------------
+__global__ void post_qkv_batch_kernel(__half* qkv, __half* kc, __half* vc,
+                                      const int* row_pos, const int* seq_id,
+                                      int Hq, int Hkv, int D, int qkv_row_stride,
+                                      int64_t seq_stride, const float* inv_freq,
+                                      int has_qknorm, const __half* qn,
+                                      const __half* kn, float eps) {
+  int hb = blockIdx.x;
+  int r = blockIdx.y;
+  int d = threadIdx.x;
+  __shared__ float red[2];
+  int half = D / 2;
+  bool is_q = hb < Hq;
+  bool is_k = !is_q && hb < Hq + Hkv;
+  int kvh = is_q ? 0 : (is_k ? hb - Hq : hb - Hq - Hkv);
+  int64_t row_base = static_cast<int64_t>(r) * qkv_row_stride;
+  __half* src = is_q ? qkv + row_base + static_cast<int64_t>(hb) * D
+              : is_k ? qkv + row_base + static_cast<int64_t>(Hq + kvh) * D
+                     : qkv + row_base + static_cast<int64_t>(Hq + Hkv + kvh) * D;
+
+  float v = __half2float(src[d]);
+  if (has_qknorm && hb < Hq + Hkv) {
+    float sumsq = gemv_warp_reduce(v * v);
+    if (threadIdx.x % 64 == 0) red[threadIdx.x / 64] = sumsq;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      float total = 0.0f;
+      for (int i = 0; i < blockDim.x / 64; ++i) total += red[i];
+      red[1] = rsqrtf(total / D + eps);
+    }
+    __syncthreads();
+    v *= red[1] * __half2float(is_q ? qn[d] : kn[d]);
+    src[d] = __float2half(v);
+    __syncthreads();
+  }
+
+  __half* dst;
+  if (is_q) {
+    dst = qkv + row_base + static_cast<int64_t>(hb) * D;
+  } else {
+    int64_t cache_off = static_cast<int64_t>(seq_id[r]) * seq_stride +
+                        static_cast<int64_t>(row_pos[r]) * (Hkv * D) +
+                        static_cast<int64_t>(kvh) * D;
+    dst = (is_k ? kc : vc) + cache_off;
+  }
+
+  if (hb < Hq + Hkv) {
+    if (d < half) {
+      float x1 = __half2float(src[d]);
+      float x2 = __half2float(src[d + half]);
+      float angle = static_cast<float>(row_pos[r]) * inv_freq[d];
+      float c = cosf(angle), s = sinf(angle);
+      dst[d] = __float2half(x1 * c - x2 * s);
+      dst[d + half] = __float2half(x1 * s + x2 * c);
+    }
+  } else {
+    dst[d] = src[d];
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Decode post-QKV fusion. One block per (q head | k head | v head):
 //   q heads:   optional per-head RMSNorm, RoPE, write back to qkv buffer
 //   k heads:   optional RMSNorm, RoPE, write straight into the KV cache
@@ -137,6 +200,44 @@ void gemv_fp32out(void* y, const void* w, const void* x, int n_rows, int k_cols,
                      static_cast<__half*>(nullptr), static_cast<float*>(y),
                      static_cast<const __half*>(w),
                      static_cast<const __half*>(x), k_cols, /*mode=*/2);
+}
+
+void decode_post_qkv_batch_fp16(void* qkv, void* k_base, void* v_base,
+                                const void* row_pos, const void* seq_id,
+                                int rows, int heads, int kv_heads, int head_dim,
+                                int qkv_row_stride, int64_t seq_stride_elems,
+                                const void* inv_freq, bool has_qknorm,
+                                const void* qn_weight, const void* kn_weight,
+                                float eps, hipStream_t stream) {
+  if (rows <= 0) return;
+  dim3 grid(heads + 2 * kv_heads, rows);
+  if (head_dim == 128) {
+    hipLaunchKernelGGL(post_qkv_batch_kernel, grid, dim3(128), 0, stream,
+                       static_cast<__half*>(qkv), static_cast<__half*>(k_base),
+                       static_cast<__half*>(v_base),
+                       static_cast<const int*>(row_pos),
+                       static_cast<const int*>(seq_id), heads, kv_heads,
+                       head_dim, qkv_row_stride, seq_stride_elems,
+                       static_cast<const float*>(inv_freq),
+                       has_qknorm ? 1 : 0,
+                       static_cast<const __half*>(qn_weight),
+                       static_cast<const __half*>(kn_weight), eps);
+  } else if (head_dim == 64) {
+    hipLaunchKernelGGL(post_qkv_batch_kernel, grid, dim3(64), 0, stream,
+                       static_cast<__half*>(qkv), static_cast<__half*>(k_base),
+                       static_cast<__half*>(v_base),
+                       static_cast<const int*>(row_pos),
+                       static_cast<const int*>(seq_id), heads, kv_heads,
+                       head_dim, qkv_row_stride, seq_stride_elems,
+                       static_cast<const float*>(inv_freq),
+                       has_qknorm ? 1 : 0,
+                       static_cast<const __half*>(qn_weight),
+                       static_cast<const __half*>(kn_weight), eps);
+  } else {
+    throw std::runtime_error("unsupported head_dim " +
+                             std::to_string(head_dim) +
+                             " for batched decode post-qkv fusion");
+  }
 }
 
 void decode_post_qkv_fp16(void* qkv, void* k_cache, void* v_cache,

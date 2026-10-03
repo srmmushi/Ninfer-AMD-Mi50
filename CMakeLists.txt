@@ -39,6 +39,10 @@ find_package(hip REQUIRED)
 find_package(rocblas REQUIRED)
 
 option(NINFER_BUILD_APPS "Build the NInfer CLI and server" ON)
+option(NINFER_BUILD_SHARED "Build libninfer.so (C API for vLLM integration)" ON)
+
+# libninfer.so / static libninfer_core must be relocatable.
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 # gfx906 has no BF16 units: the engine computes in FP16 with FP32 accumulation.
 add_compile_definitions($<$<COMPILE_LANGUAGE:CXX>:NINFER_GFX906=1>)
@@ -73,4 +77,10 @@ if(NINFER_BUILD_APPS)
 
   add_executable(ninfer-serve src/apps/ninfer_serve.cpp src/apps/http_server.cpp)
   target_link_libraries(ninfer-serve PRIVATE ninfer_core)
+endif()
+
+if(NINFER_BUILD_SHARED)
+  add_library(ninfer SHARED src/api/ninfer_c_api.cpp)
+  target_link_libraries(ninfer PUBLIC ninfer_core)
+  set_target_properties(ninfer PROPERTIES PUBLIC_HEADER "src/api/ninfer_c_api.h")
 endif()
