@@ -64,6 +64,8 @@ int ninfer_load(const char* model_dir, const ninfer_options_t* options,
         mo.gpu_ids.push_back(options->gpus[i]);
       }
       if (mo.gpu_ids.empty()) mo.gpu_ids.push_back(0);
+      if (options->quant) mo.quant = options->quant;
+      if (options->parallel) mo.parallel = options->parallel;
     }
     eng->tokenizer =
         std::make_unique<Tokenizer>(path_join(model_dir, "tokenizer.json"));

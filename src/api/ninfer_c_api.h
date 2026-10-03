@@ -23,6 +23,8 @@ typedef struct ninfer_options {
   int num_sequences;    // concurrent KV slots (continuous batching width)
   int gpu_count;        // number of entries in `gpus`
   const int* gpus;      // device ids for layer-split pipeline parallelism
+  const char* quant;    // "fp16" (default) or "q4" (groupwise INT4)
+  const char* parallel; // "pp" (layer split, default) or "tp" (tensor parallel)
 } ninfer_options_t;
 
 // ---- engine lifecycle -----------------------------------------------------

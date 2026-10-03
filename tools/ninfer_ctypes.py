@@ -40,6 +40,8 @@ class _Options(ctypes.Structure):
         ("num_sequences", ctypes.c_int),
         ("gpu_count", ctypes.c_int),
         ("gpus", ctypes.POINTER(ctypes.c_int)),
+        ("quant", ctypes.c_char_p),
+        ("parallel", ctypes.c_char_p),
     ]
 
 
@@ -94,7 +96,9 @@ class Ninfer:
                  max_context: int = 32768,
                  prefill_chunk: int = 512,
                  num_sequences: int = 1,
-                 gpus: Optional[Sequence[int]] = None):
+                 gpus: Optional[Sequence[int]] = None,
+                 quant: str = "fp16",
+                 parallel: str = "pp"):
         self.lib = ctypes.CDLL(_find_lib(), mode=ctypes.RTLD_GLOBAL)
         # signatures
         self.lib.ninfer_load.restype = ctypes.c_int
@@ -157,7 +161,9 @@ class Ninfer:
                        prefill_chunk=prefill_chunk,
                        num_sequences=num_sequences,
                        gpu_count=len(gpus),
-                       gpus=gpu_arr)
+                       gpus=gpu_arr,
+                       quant=quant.encode(),
+                       parallel=parallel.encode())
         handle = ctypes.c_void_p()
         rc = self.lib.ninfer_load(model_dir.encode(), ctypes.byref(opt),
                                   ctypes.byref(handle))

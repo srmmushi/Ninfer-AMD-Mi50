@@ -29,6 +29,8 @@ struct ServeOptions {
   float top_p = 0.95f;
   float repeat_penalty = 1.05f;
   std::vector<int> gpu_ids = {0};
+  std::string quant = "fp16";
+  std::string parallel = "pp";
 };
 
 ServeOptions parse(int argc, char** argv) {
@@ -67,7 +69,8 @@ ServeOptions parse(int argc, char** argv) {
       }
       if (!item.empty()) o.gpu_ids.push_back(std::stoi(item));
       if (o.gpu_ids.empty()) throw std::runtime_error("empty --gpus list");
-    }
+    } else if (a == "--quant") o.quant = next();
+    else if (a == "--parallel") o.parallel = next();
     else if (a == "--log-level") {
       std::string lv = next();
       if (lv == "debug") global_log_level() = LogLevel::Debug;
@@ -212,6 +215,8 @@ int main(int argc, char** argv) {
     mo.max_context = o.max_context;
     mo.prefill_chunk = o.prefill_chunk;
     mo.gpu_ids = o.gpu_ids;
+    mo.quant = o.quant;
+    mo.parallel = o.parallel;
     Engine engine(o.model_dir, mo, !o.no_thinking);
     std::mutex gen_mutex;
 

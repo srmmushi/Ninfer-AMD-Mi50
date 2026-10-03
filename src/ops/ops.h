@@ -95,6 +95,15 @@ void scatter_add_rows_fp16(void* dst, const void* src, const int64_t* order,
 void scale_rows_fp16(void* x, const float* row_weights, int n, int dim,
                      hipStream_t stream = 0);
 
+// Column-slice of a row-major FP16 matrix (tensor-parallel weight split):
+//   dst[rows, dst_cols] = src[rows, src_cols][:, col_off : col_off + dst_cols]
+// `src` must already be offset to the first sliced row.
+void slice_cols_fp16(void* dst, const void* src, int rows, int dst_cols,
+                     int src_cols, int col_off, hipStream_t stream = 0);
+
+// In-place add: dst[i] += src[i] (used by the tensor-parallel all-reduce).
+void add_fp16(void* dst, const void* src, int64_t count, hipStream_t stream = 0);
+
 // Strided row copy, used to append K/V rows into the cache:
 //   dst assumed packed [count, dim]; src rows `count x dim` with byte-row
 //   stride `src_row_stride` (in elements) and element offset `src_elem_off`.
@@ -149,6 +158,34 @@ void decode_post_qkv_batch_fp16(void* qkv, void* k_base, void* v_base,
                                 const void* inv_freq, bool has_qknorm,
                                 const void* qn_weight, const void* kn_weight,
                                 float eps, hipStream_t stream = 0);
+
+// ---------------------------------------------------------------------------
+// Groupwise INT4 (Q4) weights. gfx906 has no FP4/NVFP4 hardware, so this is a
+// software-equivalent path: symmetric per-group (32 elements) quantization,
+// dequantized during the GEMM/GEMV accumulation. Cuts weight traffic ~4x —
+// the dominant term in decode — while keeping FP32 accumulation.
+// ---------------------------------------------------------------------------
+static constexpr int kQ4Group = 32;
+
+// Quantizes a row-major [rows, cols] FP16 matrix in place on the device:
+//   packed: uint8[rows * cols / 2]  (two nibbles per byte, low nibble first)
+//   scales: fp16[rows * cols / kQ4Group]
+void quantize_q4_fp16(const void* w_fp16, void* packed, void* scales, int rows,
+                      int cols, hipStream_t stream = 0);
+
+// Decode GEMV over Q4 weights: y[n] = sum_k dequant(w[n,k]) * x[k].
+void gemv_q4_fp16(void* y, const void* packed, const void* scales,
+                  const void* x, int n_rows, int k_cols,
+                  hipStream_t stream = 0);
+void gemv_q4_fp32out(void* y, const void* packed, const void* scales,
+                     const void* x, int n_rows, int k_cols,
+                     hipStream_t stream = 0);
+
+// Prefill GEMM over Q4 weights (fused dequant, no FP16 materialization):
+//   out[M,N] = x[M,K] * W[N,K]^T
+void gemm_q4_fp16(void* out, const void* x, const void* packed,
+                  const void* scales, int M, int N, int K,
+                  hipStream_t stream = 0);
 
 // ---------------------------------------------------------------------------
 // Attention.

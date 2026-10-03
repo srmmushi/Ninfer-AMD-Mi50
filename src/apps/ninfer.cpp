@@ -31,6 +31,8 @@ struct Options {
   int64_t seed = 0;
   std::vector<int> gpu_ids = {0};
   bool verify = false;  // dual-GPU vs single-GPU golden comparison
+  std::string quant = "fp16";    // fp16 | q4 (groupwise INT4)
+  std::string parallel = "pp";   // pp (layer split) | tp (tensor parallel)
 };
 
 std::vector<int> parse_gpu_list(const std::string& csv) {
@@ -65,6 +67,8 @@ void usage() {
                "  --repeat-penalty F repetition penalty (default 1.05)\n"
                "  --seed N           sampling seed (0 = random)\n"
                "  --gpus 0,1         layer-split pipeline across GPUs (default 0)\n"
+               "  --quant fp16|q4    weight format (q4 = groupwise INT4, ~4x less traffic)\n"
+               "  --parallel pp|tp   pp = layer split (default), tp = tensor parallel\n"
                "  --verify           dual-GPU run compared against single-GPU golden\n"
                "  --log-level debug|info|warn|error\n");
 }
@@ -96,6 +100,8 @@ Options parse(int argc, char** argv) {
     else if (a == "--seed") o.seed = std::stoll(next());
     else if (a == "--gpus") o.gpu_ids = parse_gpu_list(next());
     else if (a == "--verify") o.verify = true;
+    else if (a == "--quant") o.quant = next();
+    else if (a == "--parallel") o.parallel = next();
     else if (a == "--log-level") {
       std::string lv = next();
       if (lv == "debug") global_log_level() = LogLevel::Debug;
@@ -178,6 +184,8 @@ int main(int argc, char** argv) {
     mo.max_context = o.max_context;
     mo.prefill_chunk = o.prefill_chunk;
     mo.gpu_ids = o.gpu_ids;
+    mo.quant = o.quant;
+    mo.parallel = o.parallel;
     Engine engine(o.model_dir, mo, !o.no_thinking);
 
     std::vector<ChatMessage> messages;

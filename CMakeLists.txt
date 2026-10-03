@@ -59,6 +59,7 @@ add_library(ninfer_core STATIC
   src/ops/linear.hip
   src/ops/kernels.hip
   src/ops/gemv.hip
+  src/ops/quant.hip
   src/ops/attention.hip
   src/ops/moe.hip
   src/models/config.cpp

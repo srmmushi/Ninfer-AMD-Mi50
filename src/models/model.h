@@ -1,17 +1,23 @@
 #pragma once
-// Qwen2/Qwen3 (dense + MoE) model: weight materialization to FP16 device
-// buffers and the prefill/decode forward pass. Mirrors ninfer's
-// models/qwen3_5 Model + execution layer for the supported subset.
+// Qwen2/Qwen3 (dense + MoE) model: weight materialization to device buffers
+// and the prefill/decode forward pass. Mirrors ninfer's models/qwen3_5 Model
+// + execution layer for the supported subset.
 //
-// Multi-GPU: the transformer layers are split into contiguous shards, one
-// per device (pipeline / layer parallelism). Shard 0 owns the embedding,
-// the last shard owns the final norm + LM head. Activations cross the shard
-// boundary via hipMemcpyPeerAsync (PCIe P2P when the platform allows it).
+// Execution modes:
+//   pp (default): transformer layers split into contiguous shards, one per
+//                 device (pipeline parallelism). Shard 0 owns the embedding,
+//                 the last shard owns the final norm + LM head.
+//   tp:           tensor parallelism — every device holds all layers with
+//                 row/column-split weights (Megatron layout) and the partial
+//                 o_proj/down outputs are all-reduced over PCIe.
 //
-// Batching: forward_batch() accepts one row per input token, each row
-// carrying (token, absolute position, sequence slot). Rows of the same
-// sequence form a group and share that sequence's KV slab — this is the
-// continuous-batching entry point used by the C API / vLLM integration.
+// Weight format: fp16 (default) or groupwise INT4 ("q4"), quantized at load
+// time (gfx906 has no FP4/FP8 hardware — INT4 is dequantized during GEMM).
+//
+// Batching: forward_batch() takes one row per input token, each row carrying
+// (token, absolute position, sequence slot). Rows of the same sequence form a
+// group sharing that sequence's KV slab — the continuous-batching entry point
+// used by the C API / vLLM integration.
 
 #include <cstdint>
 #include <memory>
@@ -31,17 +37,17 @@ class DeviceBuffer;
 struct ModelOptions {
   int max_context = 32768;
   int prefill_chunk = 512;
-  // Devices to spread transformer layers across (pipeline parallelism).
-  // {0} = single GPU; {0,1} = two-way layer split.
   std::vector<int> gpu_ids = {0};
-  // Concurrent sequences (KV slabs) reserved at startup.
   int num_sequences = 1;
+  // "fp16" or "q4" (groupwise INT4, ~4x less weight traffic).
+  std::string quant = "fp16";
+  // "pp" = layer-split pipeline, "tp" = tensor parallel (dense models).
+  std::string parallel = "pp";
 };
 
 struct ForwardOutput {
   const float* logits = nullptr;  // device fp32 [rows, vocab_size]
-  int rows = 0;                   // rows == number of row groups
-  // Sequence slot for each output row (order of first appearance).
+  int rows = 0;
   std::vector<int> group_seq;
 };
 
@@ -58,25 +64,18 @@ class Model {
   int device_count() const;
   int num_sequences() const;
 
-  // Resets all per-shard KV caches (start of a new generation, all slots).
   void reset_cache();
-  // Resets one sequence slot only (request-level recycle).
   void reset_cache(int seq);
 
-  // Batched forward: `tokens[i]` sits at absolute `positions[i]` inside KV
-  // slot `seq_ids[i]`. Rows must be grouped by sequence. Returns logits for
-  // the LAST row of each sequence group.
   ForwardOutput forward_batch(const std::vector<int64_t>& tokens,
                               const std::vector<int>& positions,
                               const std::vector<int>& seq_ids,
                               hipStream_t stream);
 
-  // Single-sequence convenience wrapper (slot 0, consecutive positions).
   const float* forward(const std::vector<int64_t>& tokens, int pos0,
                        hipStream_t stream);
 
   int output_device() const;
-
   size_t weight_bytes() const;
 
  private:

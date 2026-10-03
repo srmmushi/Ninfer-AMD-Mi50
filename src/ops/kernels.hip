@@ -198,6 +198,21 @@ __global__ void softmax_causal_rows_kernel(float* s, int tq, int tk_total,
   for (int j = threadIdx.x; j < tk_total; j += blockDim.x) row[j] *= inv;
 }
 
+__global__ void slice_cols_kernel(__half* dst, const __half* src, int dst_cols,
+                                  int src_cols, int col_off, int64_t total) {
+  int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i >= total) return;
+  int r = static_cast<int>(i / dst_cols);
+  int c = static_cast<int>(i % dst_cols);
+  dst[i] = src[static_cast<int64_t>(r) * src_cols + col_off + c];
+}
+
+__global__ void add_kernel(__half* dst, const __half* src, int64_t count) {
+  int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i >= count) return;
+  dst[i] = __float2half(__half2float(dst[i]) + __half2float(src[i]));
+}
+
 __global__ void scale_rows_kernel(__half* x, const float* w, int dim) {
   int64_t row = static_cast<int64_t>(blockIdx.x);
   float s = w[row];
@@ -288,6 +303,22 @@ void softmax_causal_rows_fp32(float* s, int tq, int tk_total, int q_offset,
                               float scale, hipStream_t stream) {
   hipLaunchKernelGGL(softmax_causal_rows_kernel, dim3(tq), dim3(kBlock), 0,
                      stream, s, tq, tk_total, q_offset, scale);
+}
+
+void slice_cols_fp16(void* dst, const void* src, int rows, int dst_cols,
+                     int src_cols, int col_off, hipStream_t stream) {
+  int64_t total = static_cast<int64_t>(rows) * dst_cols;
+  int blocks = static_cast<int>((total + kBlock - 1) / kBlock);
+  hipLaunchKernelGGL(slice_cols_kernel, dim3(blocks), dim3(kBlock), 0, stream,
+                     static_cast<__half*>(dst), static_cast<const __half*>(src),
+                     dst_cols, src_cols, col_off, total);
+}
+
+void add_fp16(void* dst, const void* src, int64_t count, hipStream_t stream) {
+  int blocks = static_cast<int>((count + kBlock - 1) / kBlock);
+  hipLaunchKernelGGL(add_kernel, dim3(blocks), dim3(kBlock), 0, stream,
+                     static_cast<__half*>(dst), static_cast<const __half*>(src),
+                     count);
 }
 
 void scale_rows_fp16(void* x, const float* row_weights, int n, int dim,
