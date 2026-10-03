@@ -92,6 +92,79 @@ __global__ void gemv_kernel_vec8(__half* __restrict__ y16,
   }
 }
 
+// ---------------------------------------------------------------------------
+// Fused-epilogue GEMV (decode, M == 1).
+//   SWIGLU   : one block owns the (gate row n, up row n+inner) pair of the
+//              fused [2*inner, K] weight and writes silu(g)*u straight to act.
+//   RESIDUAL : y[n] += dot  (read-modify-write of the residual stream).
+// `aligned` selects the vectorized (uint4) or scalar loop at runtime, so a
+// single kernel covers every K.
+// ---------------------------------------------------------------------------
+template <bool SWIGLU, bool RESIDUAL>
+__global__ void gemv_fused_kernel(__half* __restrict__ y16,
+                                  const __half* __restrict__ w,
+                                  const __half* __restrict__ x, int vec8_count,
+                                  int K, int inner, int aligned) {
+  int64_t n = blockIdx.x;
+  const __half* row0 = w + n * static_cast<int64_t>(K);
+  const uint4* __restrict__ wrow = reinterpret_cast<const uint4*>(row0);
+  const uint4* __restrict__ wrow2 =
+      SWIGLU ? reinterpret_cast<const uint4*>(row0 +
+                                              static_cast<int64_t>(inner) * K)
+             : nullptr;
+  const uint4* __restrict__ xrow = reinterpret_cast<const uint4*>(x);
+  __shared__ float red[2][kGemvBlock / 64];
+  float acc = 0.0f, acc2 = 0.0f;
+
+  if (aligned) {
+    for (int i = threadIdx.x; i < vec8_count; i += blockDim.x) {
+      uint4 xv = xrow[i];
+      float xf[8];
+      gemv_unpack8(xv, xf);
+      uint4 wv = wrow[i];
+      float wf[8];
+      gemv_unpack8(wv, wf);
+#pragma unroll
+      for (int j = 0; j < 8; ++j) acc += wf[j] * xf[j];
+      if (SWIGLU) {
+        uint4 wv2 = wrow2[i];
+        float wf2[8];
+        gemv_unpack8(wv2, wf2);
+#pragma unroll
+        for (int j = 0; j < 8; ++j) acc2 += wf2[j] * xf[j];
+      }
+    }
+  } else {
+    for (int k = threadIdx.x; k < K; k += blockDim.x) {
+      float xk = __half2float(x[k]);
+      acc += __half2float(row0[k]) * xk;
+      if (SWIGLU) acc2 += __half2float(row0[static_cast<int64_t>(inner) * K + k]) * xk;
+    }
+  }
+
+  acc = gemv_warp_reduce(acc);
+  if (threadIdx.x % 64 == 0) red[0][threadIdx.x / 64] = acc;
+  if (SWIGLU) {
+    acc2 = gemv_warp_reduce(acc2);
+    if (threadIdx.x % 64 == 0) red[1][threadIdx.x / 64] = acc2;
+  }
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    float g = 0.0f;
+    for (int i = 0; i < blockDim.x / 64; ++i) g += red[0][i];
+    if (SWIGLU) {
+      float u = 0.0f;
+      for (int i = 0; i < blockDim.x / 64; ++i) u += red[1][i];
+      // SwiGLU: silu(gate) * up, computed in the epilogue.
+      y16[n] = __float2half((g / (1.0f + expf(-g))) * u);
+    } else if (RESIDUAL) {
+      y16[n] = __float2half(__half2float(y16[n]) + g);
+    } else {
+      y16[n] = __float2half(g);
+    }
+  }
+}
+
 // Scalar fallback (K % 8 != 0): LDS-staged activation, one element per load.
 __global__ void gemv_kernel(__half* y16, float* y32, const __half* w,
                             const __half* x, int K, int mode) {
@@ -289,6 +362,32 @@ void gemv_fp32out(void* y, const void* w, const void* x, int n_rows, int k_cols,
                      static_cast<__half*>(nullptr), static_cast<float*>(y),
                      static_cast<const __half*>(w),
                      static_cast<const __half*>(x), k_cols, /*mode=*/2);
+}
+
+void gemv_swiglu_fp16(void* act, const void* w_gate_up, const void* x,
+                      int inner, int k_cols, hipStream_t stream) {
+  if (inner <= 0) return;
+  int aligned = (k_cols % 8 == 0) ? 1 : 0;
+  int vec8 = k_cols / 8;
+  int block = aligned ? std::min(kGemvBlock, (vec8 + 63) / 64 * 64) : kGemvBlock;
+  hipLaunchKernelGGL((gemv_fused_kernel<true, false>), dim3(inner), dim3(block),
+                     0, stream, static_cast<__half*>(act),
+                     static_cast<const __half*>(w_gate_up),
+                     static_cast<const __half*>(x), vec8, k_cols, inner,
+                     aligned);
+}
+
+void gemv_residual_fp16(void* hidden_io, const void* w, const void* x,
+                        int n_rows, int k_cols, hipStream_t stream) {
+  if (n_rows <= 0) return;
+  int aligned = (k_cols % 8 == 0) ? 1 : 0;
+  int vec8 = k_cols / 8;
+  int block = aligned ? std::min(kGemvBlock, (vec8 + 63) / 64 * 64) : kGemvBlock;
+  hipLaunchKernelGGL((gemv_fused_kernel<false, true>), dim3(n_rows),
+                     dim3(block), 0, stream, static_cast<__half*>(hidden_io),
+                     static_cast<const __half*>(w),
+                     static_cast<const __half*>(x), vec8, k_cols, /*inner=*/0,
+                     aligned);
 }
 
 void decode_post_qkv_batch_fp16(void* qkv, void* k_base, void* v_base,

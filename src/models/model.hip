@@ -310,9 +310,30 @@ struct Model::Impl {
       fused_residual_rmsnorm_fp16(hidden.data(), proj.data(), normed.data(),
                                   L.ln2.fp.data(), T, Hdim, eps, stream);
       if (!is_moe) {
-        linear(gate_up.data(), L.gu, normed.data(), T, false);
-        silu_and_mul_fp16(act.data(), gate_up.data(), T, Iloc, stream);
-        linear(proj.data(), L.down, act.data(), T, false);
+        if (T == 1 && tp_world == 1) {
+          // Decode fast path: gate/up GEMV with SwiGLU in the epilogue (one
+          // kernel instead of GEMV + silu_and_mul), then down GEMV with the
+          // residual add in the epilogue (one kernel instead of GEMV + add).
+          if (L.gu.is_q4) {
+            gemv_swiglu_q4_fp16(act.data(), L.gu.qp.data(), L.gu.qs.data(),
+                                normed.data(), Iloc, Hdim, stream);
+          } else {
+            gemv_swiglu_fp16(act.data(), L.gu.fp.data(), normed.data(), Iloc,
+                             Hdim, stream);
+          }
+          if (L.down.is_q4) {
+            gemv_residual_q4_fp16(hidden.data(), L.down.qp.data(),
+                                  L.down.qs.data(), act.data(), Hdim, Iloc,
+                                  stream);
+          } else {
+            gemv_residual_fp16(hidden.data(), L.down.fp.data(), act.data(),
+                               Hdim, Iloc, stream);
+          }
+        } else {
+          linear(gate_up.data(), L.gu, normed.data(), T, false);
+          silu_and_mul_fp16(act.data(), gate_up.data(), T, Iloc, stream);
+          linear(proj.data(), L.down, act.data(), T, false);
+        }
       } else {
         int E = num_experts;
         int topk = top_k_experts;
@@ -412,7 +433,12 @@ struct Model::Impl {
       }
     }
 
+    // The FFN residual is fused into the down GEMV only for single-GPU decode
+    // of dense models (in tp mode `down` is column-split, so its partial
+    // output must be all-reduced before it may touch the residual stream).
     void layer_end(int T) {
+      bool fused = (T == 1 && !is_moe && tp_world == 1);
+      if (fused) return;
       residual_add_fp16(hidden.data(), proj.data(), T, Hdim, 0);
     }
 

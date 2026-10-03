@@ -181,6 +181,24 @@ void gemv_q4_fp32out(void* y, const void* packed, const void* scales,
                      const void* x, int n_rows, int k_cols,
                      hipStream_t stream = 0);
 
+// Fused decode FFN epilogues (M == 1). Both remove one kernel launch and one
+// full activation round trip per layer:
+//   swiglu   : act[i] = silu(gate_i) * up_i, one block computes the gate row
+//              (i) and the up row (i + inner) of the fused [2*inner, K] weight
+//              and multiplies them in the epilogue (no gate_up buffer pass).
+//   residual : hidden[n] += W[n,:] . x  (in-place read-modify-write), used by
+//              down_proj so the separate residual_add kernel disappears.
+void gemv_swiglu_fp16(void* act, const void* w_gate_up, const void* x,
+                      int inner, int k_cols, hipStream_t stream = 0);
+void gemv_residual_fp16(void* hidden_io, const void* w, const void* x,
+                        int n_rows, int k_cols, hipStream_t stream = 0);
+void gemv_swiglu_q4_fp16(void* act, const void* packed, const void* scales,
+                         const void* x, int inner, int k_cols,
+                         hipStream_t stream = 0);
+void gemv_residual_q4_fp16(void* hidden_io, const void* packed,
+                           const void* scales, const void* x, int n_rows,
+                           int k_cols, hipStream_t stream = 0);
+
 // Prefill GEMM over Q4 weights (fused dequant, no FP16 materialization):
 //   out[M,N] = x[M,K] * W[N,K]^T
 void gemm_q4_fp16(void* out, const void* x, const void* packed,
