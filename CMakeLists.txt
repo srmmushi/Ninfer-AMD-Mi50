@@ -81,7 +81,12 @@ if(NINFER_BUILD_APPS)
 endif()
 
 if(NINFER_BUILD_SHARED)
-  add_library(ninfer SHARED src/api/ninfer_c_api.cpp)
-  target_link_libraries(ninfer PUBLIC ninfer_core)
-  set_target_properties(ninfer PROPERTIES PUBLIC_HEADER "src/api/ninfer_c_api.h")
+  # NOTE: the CLI executable above is also named "ninfer"; give the shared
+  # library a distinct CMake target name but keep the produced file as
+  # libninfer.so (via OUTPUT_NAME) so the C API / vLLM integration is intact.
+  add_library(ninfer_shared SHARED src/api/ninfer_c_api.cpp)
+  target_link_libraries(ninfer_shared PUBLIC ninfer_core)
+  set_target_properties(ninfer_shared PROPERTIES
+    OUTPUT_NAME ninfer
+    PUBLIC_HEADER "src/api/ninfer_c_api.h")
 endif()
