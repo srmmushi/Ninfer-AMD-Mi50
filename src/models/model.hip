@@ -437,7 +437,7 @@ struct Model::Impl {
     // The FFN residual is fused into the down GEMV only for single-GPU decode
     // of dense models (in tp mode `down` is column-split, so its partial
     // output must be all-reduced before it may touch the residual stream).
-    void layer_end(int T) {
+    void end_layer(int T) {
       bool fused = (T == 1 && !is_moe && tp_world == 1);
       if (fused) return;
       residual_add_fp16(hidden.data(), proj.data(), T, Hdim, 0);
@@ -696,7 +696,8 @@ struct Model::Impl {
     // ---- embeddings / rows upload ----
     void begin_rows(const std::vector<int64_t>& tokens,
                     const std::vector<int>& positions,
-                    const std::vector<int>& seq_ids) {
+                    const std::vector<int>& seq_ids,
+                    bool skip_upload = false) {
       hipStream_t stream = 0;
       int T = static_cast<int>(tokens.size());
       // During capture skip the host->device uploads: the token/position are
@@ -916,7 +917,7 @@ struct Model::Impl {
       for (int j = 0; j < n; ++j) {
         if (i == j) continue;
         DeviceGuard g(gpus[i]);
-        hipError_t e = hipDeviceEnablePeerAccess(gpus[j]);
+        hipError_t e = hipDeviceEnablePeerAccess(gpus[j], 0);
         if (e != hipSuccess && e != hipErrorPeerAccessAlreadyEnabled) {
           LOG_WARN("P2P dev%d->dev%d unavailable (%s); using staged copies",
                    gpus[i], gpus[j], hipGetErrorString(e));
@@ -1020,7 +1021,7 @@ struct Model::Impl {
         for (int li = 0; li < static_cast<int>(cur.lw.size()); ++li) {
           cur.layer_start(li, groups, T, all_single, false);
           cur.layer_mid(li, T);
-          cur.layer_end(T);
+          cur.end_layer(T);
         }
         out = cur.finalize(groups);
         if (s + 1 < shards.size()) {
@@ -1052,7 +1053,7 @@ struct Model::Impl {
       tp_allreduce(T);  // down_proj partials
       for (auto& s : shards) {
         DeviceGuard g(s->device);
-        s->layer_end(T);
+        s->end_layer(T);
       }
     }
     for (auto& s : shards) {

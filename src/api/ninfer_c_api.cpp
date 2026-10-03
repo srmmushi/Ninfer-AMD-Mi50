@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "common/log.h"
+#include "common/util.h"
 #include "core/device.h"
 #include "frontend/tokenizer.h"
 #include "models/model.h"
@@ -14,10 +15,10 @@
 
 using namespace ninfer;
 
-namespace {
-
 // Slot allocator: num_sequences KV slabs are reserved at load time and
-// handed out round-robin to sessions.
+// handed out round-robin to sessions. These structs must live in the global
+// namespace so they match the forward declaration in ninfer_c_api.h
+// (typedef struct ninfer_engine ninfer_engine_t).
 struct ninfer_engine {
   std::unique_ptr<Model> model;
   std::unique_ptr<Tokenizer> tokenizer;
@@ -29,6 +30,8 @@ struct ninfer_session {
   int slot = 0;
   int length = 0;  // tokens currently resident in this slot
 };
+
+namespace {
 
 // Copies `vocab` floats of the logits row `row` from the head device.
 int copy_logits_row(ninfer_engine* eng, const float* device_logits, int row,
